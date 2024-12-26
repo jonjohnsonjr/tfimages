@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strings"
 	"time"
 
 	"chainguard.dev/apko/pkg/build/types"
@@ -20,6 +21,7 @@ import (
 	tfjson "github.com/hashicorp/terraform-json"
 	"github.com/skratchdot/open-golang/open"
 	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v2"
 )
 
 func main() {
@@ -31,71 +33,6 @@ func main() {
 			log.Panic(err)
 		}
 	}
-}
-
-func runDiff(ctx context.Context, args []string) error {
-	var hs []handler
-	for _, arg := range args {
-		log.Printf("decoding plan")
-		f, err := os.Open(arg)
-		if err != nil {
-			return err
-		}
-		var p tfjson.Plan
-		if err := json.NewDecoder(f).Decode(&p); err != nil {
-			return err
-		}
-
-		h := handler{
-			configs:   map[string]map[string]*imageConfig{},
-			byPackage: map[string]map[string]*imageConfig{},
-		}
-
-		log.Printf("walking modules")
-		if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
-			return err
-		}
-		hs = append(hs, h)
-	}
-
-	lhs, rhs := hs[0], hs[1]
-
-	same := 0
-	for repo, lByAddr := range lhs.configs {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		rByAddr := rhs.configs[repo]
-
-		for addr, lcfg := range lByAddr {
-			rcfg := rByAddr[addr]
-
-			if rcfg == nil {
-				if same != 0 {
-					fmt.Printf("%d same\n", same)
-				}
-				same = 0
-				fmt.Printf("missing rcfg for %q\n", addr)
-				continue
-			}
-
-			if diff := cmp.Diff(lcfg.config, rcfg.config); diff != "" {
-				if same != 0 {
-					fmt.Printf("%d same\n", same)
-				}
-				same = 0
-				fmt.Printf("diff %q\n", addr)
-				fmt.Printf("%s\n\n", diff)
-			} else {
-				same++
-			}
-		}
-	}
-	if same != 0 {
-		fmt.Printf("%d same\n", same)
-	}
-	return nil
 }
 
 func run(ctx context.Context) error {
@@ -110,14 +47,45 @@ func run(ctx context.Context) error {
 	}
 
 	h := handler{
-		configs:   map[string]map[string]*imageConfig{},
-		byPackage: map[string]map[string]*imageConfig{},
+		repoByAddr:   map[string]string{},
+		configs:      map[string]*imageConfig{},
+		builds:       map[string]map[string]*imageBuild{},
+		byAddr:       map[string]*imageBuild{},
+		byPackage:    map[string]map[string]*imageBuild{},
+		byConstraint: map[string]map[string]*imageConfig{},
 	}
 
-	log.Printf("walking modules")
+	log.Printf("walking planned values")
 	if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
 		return err
 	}
+	log.Printf("walking prior state")
+	if err := h.walkModules(p.PriorState.Values.RootModule); err != nil {
+		return err
+	}
+
+	total := 0
+	for _, builds := range h.builds {
+		total += len(builds)
+	}
+	log.Printf("%d configs, %d builds", len(h.configs), total)
+
+	// TODO: Expose this for digging into weird ones.
+	// for addr := range h.configs {
+	// 	buildAddr := strings.ReplaceAll(addr, "data.apko_config", "apko_build")
+	// 	if _, ok := h.byAddr[buildAddr]; !ok {
+	// 		log.Printf("%s", addr)
+	// 	}
+	// }
+
+	// log.Printf("%d unsolved, %d solved", len(h.configs), total)
+
+	// for addr := range h.byAddr {
+	// 	cfgAddr := strings.ReplaceAll(addr, "apko_build", "data.apko_config")
+	// 	if _, ok := h.configs[cfgAddr]; !ok {
+	// 		log.Printf("%s", addr)
+	// 	}
+	// }
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s", r.Method, r.URL.String())
@@ -157,40 +125,71 @@ func run(ctx context.Context) error {
 }
 
 type handler struct {
-	configs   map[string]map[string]*imageConfig
-	byPackage map[string]map[string]*imageConfig
+	repoByAddr   map[string]string
+	configs      map[string]*imageConfig
+	builds       map[string]map[string]*imageBuild
+	byAddr       map[string]*imageBuild
+	byPackage    map[string]map[string]*imageBuild
+	byConstraint map[string]map[string]*imageConfig
 }
 
-type imageConfig struct {
+type imageBuild struct {
 	repo   string
 	addr   string
 	config *types.ImageConfiguration
 }
 
-func (h *handler) add(repo, addr string, ic *types.ImageConfiguration) {
-	byAddr, ok := h.configs[repo]
+type imageConfig struct {
+	addr   string
+	config *types.ImageConfiguration
+}
+
+func (h *handler) build(repo, addr string, ic *types.ImageConfiguration) {
+	byAddr, ok := h.builds[repo]
 	if !ok {
-		byAddr = map[string]*imageConfig{}
+		byAddr = map[string]*imageBuild{}
 	}
 
-	cfg := &imageConfig{
+	cfg := &imageBuild{
 		repo:   repo,
 		addr:   addr,
 		config: ic,
 	}
 
 	byAddr[addr] = cfg
+	h.byAddr[addr] = cfg
 
-	h.configs[repo] = byAddr
+	h.builds[repo] = byAddr
+
+	h.repoByAddr[addr] = repo
 
 	for _, pkg := range ic.Contents.Packages {
 		byAddr, ok := h.byPackage[pkg]
+		if !ok {
+			byAddr = map[string]*imageBuild{}
+		}
+		byAddr[addr] = cfg
+
+		h.byPackage[pkg] = byAddr
+	}
+}
+
+func (h *handler) config(addr string, ic *types.ImageConfiguration) {
+	cfg := &imageConfig{
+		addr:   addr,
+		config: ic,
+	}
+
+	h.configs[addr] = cfg
+
+	for _, pkg := range ic.Contents.Packages {
+		byAddr, ok := h.byConstraint[pkg]
 		if !ok {
 			byAddr = map[string]*imageConfig{}
 		}
 		byAddr[addr] = cfg
 
-		h.byPackage[pkg] = byAddr
+		h.byConstraint[pkg] = byAddr
 	}
 }
 
@@ -203,6 +202,14 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
 		return h.renderPackages(w)
 	}
 
+	if r.URL.Path == "/configs" {
+		return h.renderConfigs(w)
+	}
+
+	if r.URL.Path == "/constraints" {
+		return h.renderConstraints(w)
+	}
+
 	if r.URL.Path != "/" {
 		return nil
 	}
@@ -211,6 +218,8 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
 	addr := qs.Get("addr")
 	repo := qs.Get("repo")
 	pkg := qs.Get("pkg")
+	cfg := qs.Get("cfg")
+	constraint := qs.Get("constraint")
 
 	if addr != "" {
 		return h.renderAddr(w, repo, addr)
@@ -218,8 +227,12 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
 		return h.renderPkgRepo(w, pkg, repo)
 	} else if pkg != "" {
 		return h.renderPkg(w, pkg)
+	} else if constraint != "" {
+		return h.renderConstraint(w, constraint)
 	} else if repo != "" {
 		return h.renderRepo(w, repo)
+	} else if cfg != "" {
+		return h.renderCfg(w, cfg)
 	} else {
 		h.renderLanding(w)
 	}
@@ -230,23 +243,29 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
 func (h *handler) renderAddr(w http.ResponseWriter, repo, addr string) error {
 	defer boilerplate(w)()
 
-	byAddr, ok := h.configs[repo]
+	byAddr, ok := h.builds[repo]
 	if !ok {
 		return errorf(w, "no repo %q", repo)
 	}
 
-	config, ok := byAddr[addr]
+	build, ok := byAddr[addr]
 	if !ok {
 		return errorf(w, "no addr %q", addr)
 	}
 
 	fmt.Fprintf(w, "<h1>%s</h1>\n", repo)
 	fmt.Fprintf(w, "<h2>%s</h2>\n", addr)
+
+	cfgAddr := strings.ReplaceAll(addr, "apko_build", "data.apko_config")
+	if _, ok := h.configs[cfgAddr]; ok {
+		fmt.Fprintf(w, "<a href=/?cfg=%s>%s</a>\n", url.QueryEscape(cfgAddr), html.EscapeString(cfgAddr))
+	}
+
 	fmt.Fprintf(w, "<pre>\n")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(linkify(*config.config)); err != nil {
+	if err := enc.Encode(linkify(*build.config)); err != nil {
 		return errorf(w, "encode: %w", err)
 	}
 	fmt.Fprintf(w, "</pre>\n")
@@ -268,7 +287,7 @@ func (h *handler) renderRepo(w http.ResponseWriter, repo string) error {
 
 	fmt.Fprintf(w, "<h1>%s</h1>\n", repo)
 	fmt.Fprintf(w, "<ul>\n")
-	byAddr, ok := h.configs[repo]
+	byAddr, ok := h.builds[repo]
 	if !ok {
 		return errorf(w, "no repo %q", repo)
 	}
@@ -287,7 +306,7 @@ func (h *handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
 	fmt.Fprintf(w, "<h1>%s</h1>\n", repo)
 	fmt.Fprintf(w, "<h2>containing %s</h2>\n", pkg)
 	fmt.Fprintf(w, "<ul>\n")
-	fromRepo, ok := h.configs[repo]
+	fromRepo, ok := h.builds[repo]
 	if !ok {
 		return errorf(w, "no repo %q", repo)
 	}
@@ -330,12 +349,57 @@ func (h *handler) renderPkg(w http.ResponseWriter, pkg string) error {
 	return nil
 }
 
+func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
+	defer boilerplate(w)()
+
+	config, ok := h.configs[addr]
+	if !ok {
+		return errorf(w, "no addr %q", addr)
+	}
+
+	fmt.Fprintf(w, "<h1>%s</h1>\n", addr)
+
+	buildAddr := strings.ReplaceAll(addr, "data.apko_config", "apko_build")
+	if repo, ok := h.repoByAddr[buildAddr]; ok {
+		fmt.Fprintf(w, "<a href=/?repo=%s&addr=%s>%s</a>\n", url.QueryEscape(repo), url.QueryEscape(buildAddr), html.EscapeString(buildAddr))
+	}
+
+	fmt.Fprintf(w, "<pre>\n")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(config.config); err != nil {
+		return errorf(w, "encode: %w", err)
+	}
+	fmt.Fprintf(w, "</pre>\n")
+
+	return nil
+}
+
+func (h *handler) renderConstraint(w http.ResponseWriter, constraint string) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h1>Configs containing %s</h1>\n", constraint)
+	fmt.Fprintf(w, "<ul>\n")
+	fromConstraint, ok := h.byConstraint[constraint]
+	if !ok {
+		return errorf(w, "no constraint %q", constraint)
+	}
+
+	for _, addr := range slices.Sorted(maps.Keys(fromConstraint)) {
+		href := fmt.Sprintf("/?cfg=%s", url.QueryEscape(addr))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
 func (h *handler) renderImages(w http.ResponseWriter) error {
 	defer boilerplate(w)()
 
 	fmt.Fprintf(w, "<h1>Images</h1>\n")
 	fmt.Fprintf(w, "<ul>\n")
-	for _, repo := range slices.Sorted(maps.Keys(h.configs)) {
+	for _, repo := range slices.Sorted(maps.Keys(h.builds)) {
 		href := fmt.Sprintf("/?repo=%s", url.QueryEscape(repo))
 		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(repo))
 	}
@@ -358,12 +422,42 @@ func (h *handler) renderPackages(w http.ResponseWriter) error {
 	return nil
 }
 
+func (h *handler) renderConfigs(w http.ResponseWriter) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h1>Configs</h1>\n")
+	fmt.Fprintf(w, "<ul>\n")
+	for _, addr := range slices.Sorted(maps.Keys(h.configs)) {
+		href := fmt.Sprintf("/?cfg=%s", url.QueryEscape(addr))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
+func (h *handler) renderConstraints(w http.ResponseWriter) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h1>Constraints</h1>\n")
+	fmt.Fprintf(w, "<ul>\n")
+	for _, pkg := range slices.Sorted(maps.Keys(h.byConstraint)) {
+		href := fmt.Sprintf("/?constraint=%s", url.QueryEscape(pkg))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(pkg))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
 func (h *handler) renderLanding(w http.ResponseWriter) {
 	defer boilerplate(w)()
 
 	fmt.Fprintf(w, "<h1>Plan</h1>\n")
-	fmt.Fprintf(w, "<p><a href=%q>Images (%d)</a></p>\n", "images", len(h.configs))
+	fmt.Fprintf(w, "<p><a href=%q>Images (%d)</a></p>\n", "images", len(h.builds))
 	fmt.Fprintf(w, "<p><a href=%q>Packages (%d)</a></p>\n", "packages", len(h.byPackage))
+	fmt.Fprintf(w, "<p><a href=%q>Configs (%d)</a></p>\n", "configs", len(h.configs))
+	fmt.Fprintf(w, "<p><a href=%q>Constraints (%d)</a></p>\n", "constraints", len(h.byConstraint))
 }
 
 func (h *handler) walkModules(m *tfjson.StateModule) error {
@@ -394,7 +488,42 @@ func (h *handler) walkModules(m *tfjson.StateModule) error {
 				return fmt.Errorf("unmarshal: %w", err)
 			}
 
-			h.add(repo, r.Address, &ic)
+			h.build(repo, r.Address, &ic)
+		}
+		if r.Type == "apko_config" {
+			config, ok := r.AttributeValues["config_contents"]
+			if !ok {
+				return fmt.Errorf("missing config: %s", r.Address)
+			}
+
+			s, ok := config.(string)
+			if !ok {
+				return fmt.Errorf("config is a %T: %s", config, r.Address)
+			}
+
+			var ic types.ImageConfiguration
+			if err := yaml.UnmarshalStrict([]byte(s), &ic); err != nil {
+				log.Printf("%s", s)
+				return fmt.Errorf("unmarshal: %w", err)
+			}
+
+			extra, ok := r.AttributeValues["extra_packages"]
+			if ok && extra != nil {
+				pkgs, ok := extra.([]any)
+				if !ok {
+					return fmt.Errorf("extra_packages is a %T: %s", extra, r.Address)
+				}
+				for _, pkg := range pkgs {
+					ic.Contents.Packages = append(ic.Contents.Packages, pkg.(string))
+				}
+			}
+
+			h.config(r.Address, &ic)
+		} else {
+			_, ok := r.AttributeValues["config_contents"]
+			if ok {
+				log.Printf("config_contents in %q", r.Type)
+			}
 		}
 	}
 
@@ -429,4 +558,72 @@ func boilerplate(w http.ResponseWriter) func() {
 		fmt.Fprintf(w, "</body>\n")
 		fmt.Fprintf(w, "</html>\n")
 	}
+}
+
+func runDiff(ctx context.Context, args []string) error {
+	var hs []handler
+	for _, arg := range args {
+		log.Printf("decoding plan")
+		f, err := os.Open(arg)
+		if err != nil {
+			return err
+		}
+		var p tfjson.Plan
+		if err := json.NewDecoder(f).Decode(&p); err != nil {
+			return err
+		}
+
+		h := handler{
+			repoByAddr:   map[string]string{},
+			configs:      map[string]*imageConfig{},
+			builds:       map[string]map[string]*imageBuild{},
+			byPackage:    map[string]map[string]*imageBuild{},
+			byConstraint: map[string]map[string]*imageConfig{},
+		}
+
+		log.Printf("walking planned values")
+		if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
+			return err
+		}
+		hs = append(hs, h)
+	}
+
+	lhs, rhs := hs[0], hs[1]
+
+	same := 0
+	for repo, lByAddr := range lhs.builds {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		rByAddr := rhs.builds[repo]
+
+		for addr, lcfg := range lByAddr {
+			rcfg := rByAddr[addr]
+
+			if rcfg == nil {
+				if same != 0 {
+					fmt.Printf("%d same\n", same)
+				}
+				same = 0
+				fmt.Printf("missing rcfg for %q\n", addr)
+				continue
+			}
+
+			if diff := cmp.Diff(lcfg.config, rcfg.config); diff != "" {
+				if same != 0 {
+					fmt.Printf("%d same\n", same)
+				}
+				same = 0
+				fmt.Printf("diff %q\n", addr)
+				fmt.Printf("%s\n\n", diff)
+			} else {
+				same++
+			}
+		}
+	}
+	if same != 0 {
+		fmt.Printf("%d same\n", same)
+	}
+	return nil
 }
