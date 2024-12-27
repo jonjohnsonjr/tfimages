@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -49,10 +50,28 @@ func run(ctx context.Context) error {
 	h := handler{
 		repoByAddr:   map[string]string{},
 		configs:      map[string]*imageConfig{},
-		builds:       map[string]map[string]*imageBuild{},
-		byAddr:       map[string]*imageBuild{},
+		byRepo:       map[string]map[string]*imageBuild{},
+		builds:       map[string]*imageBuild{},
 		byPackage:    map[string]map[string]*imageBuild{},
 		byConstraint: map[string]map[string]*imageConfig{},
+	}
+
+	if apkoConfig, ok := p.Config.ProviderConfigs["apko"]; ok {
+		if exprs, ok := apkoConfig.Expressions["extra_packages"]; ok {
+			cv := exprs.ConstantValue
+			list, ok := cv.([]any)
+			if !ok {
+				return fmt.Errorf("extra_packages is a %T", cv)
+			}
+
+			for _, el := range list {
+				if pkg, ok := el.(string); ok {
+					h.extraPackages = append(h.extraPackages, pkg)
+				} else {
+					return fmt.Errorf("extra_packages element is a %T", el)
+				}
+			}
+		}
 	}
 
 	log.Printf("walking planned values")
@@ -64,28 +83,37 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	total := 0
-	for _, builds := range h.builds {
-		total += len(builds)
+	log.Printf("%d configs, %d builds", len(h.configs), len(h.builds))
+
+	h.orphans = make([]string, 0, len(h.configs)-len(h.builds))
+
+	for addr := range h.configs {
+		buildAddr := strings.ReplaceAll(addr, "data.apko_config", "apko_build")
+		if _, ok := h.builds[buildAddr]; !ok {
+			h.orphans = append(h.orphans, addr)
+		}
 	}
-	log.Printf("%d configs, %d builds", len(h.configs), total)
 
-	// TODO: Expose this for digging into weird ones.
-	// for addr := range h.configs {
-	// 	buildAddr := strings.ReplaceAll(addr, "data.apko_config", "apko_build")
-	// 	if _, ok := h.byAddr[buildAddr]; !ok {
-	// 		log.Printf("%s", addr)
-	// 	}
-	// }
+	slices.Sort(h.orphans)
 
-	// log.Printf("%d unsolved, %d solved", len(h.configs), total)
+	versions := map[string]map[string]any{}
+	for pkg := range h.byPackage {
+		p, v, ok := strings.Cut(pkg, "=")
+		if !ok {
+			panic(pkg)
+		}
+		if _, ok := versions[p]; !ok {
+			versions[p] = map[string]any{}
+		}
+		versions[p][v] = struct{}{}
+	}
 
-	// for addr := range h.byAddr {
-	// 	cfgAddr := strings.ReplaceAll(addr, "apko_build", "data.apko_config")
-	// 	if _, ok := h.configs[cfgAddr]; !ok {
-	// 		log.Printf("%s", addr)
-	// 	}
-	// }
+	h.duplicates = map[string]map[string]any{}
+	for p, vs := range versions {
+		if len(vs) != 1 {
+			h.duplicates[p] = vs
+		}
+	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s", r.Method, r.URL.String())
@@ -125,12 +153,16 @@ func run(ctx context.Context) error {
 }
 
 type handler struct {
-	repoByAddr   map[string]string
 	configs      map[string]*imageConfig
-	builds       map[string]map[string]*imageBuild
-	byAddr       map[string]*imageBuild
-	byPackage    map[string]map[string]*imageBuild
 	byConstraint map[string]map[string]*imageConfig
+	builds       map[string]*imageBuild
+	byRepo       map[string]map[string]*imageBuild
+	byPackage    map[string]map[string]*imageBuild
+	repoByAddr   map[string]string
+	orphans      []string
+	duplicates   map[string]map[string]any
+
+	extraPackages []string
 }
 
 type imageBuild struct {
@@ -142,322 +174,6 @@ type imageBuild struct {
 type imageConfig struct {
 	addr   string
 	config *types.ImageConfiguration
-}
-
-func (h *handler) build(repo, addr string, ic *types.ImageConfiguration) {
-	byAddr, ok := h.builds[repo]
-	if !ok {
-		byAddr = map[string]*imageBuild{}
-	}
-
-	cfg := &imageBuild{
-		repo:   repo,
-		addr:   addr,
-		config: ic,
-	}
-
-	byAddr[addr] = cfg
-	h.byAddr[addr] = cfg
-
-	h.builds[repo] = byAddr
-
-	h.repoByAddr[addr] = repo
-
-	for _, pkg := range ic.Contents.Packages {
-		byAddr, ok := h.byPackage[pkg]
-		if !ok {
-			byAddr = map[string]*imageBuild{}
-		}
-		byAddr[addr] = cfg
-
-		h.byPackage[pkg] = byAddr
-	}
-}
-
-func (h *handler) config(addr string, ic *types.ImageConfiguration) {
-	cfg := &imageConfig{
-		addr:   addr,
-		config: ic,
-	}
-
-	h.configs[addr] = cfg
-
-	for _, pkg := range ic.Contents.Packages {
-		byAddr, ok := h.byConstraint[pkg]
-		if !ok {
-			byAddr = map[string]*imageConfig{}
-		}
-		byAddr[addr] = cfg
-
-		h.byConstraint[pkg] = byAddr
-	}
-}
-
-func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
-	if r.URL.Path == "/images" {
-		return h.renderImages(w)
-	}
-
-	if r.URL.Path == "/packages" {
-		return h.renderPackages(w)
-	}
-
-	if r.URL.Path == "/configs" {
-		return h.renderConfigs(w)
-	}
-
-	if r.URL.Path == "/constraints" {
-		return h.renderConstraints(w)
-	}
-
-	if r.URL.Path != "/" {
-		return nil
-	}
-
-	qs := r.URL.Query()
-	addr := qs.Get("addr")
-	repo := qs.Get("repo")
-	pkg := qs.Get("pkg")
-	cfg := qs.Get("cfg")
-	constraint := qs.Get("constraint")
-
-	if addr != "" {
-		return h.renderAddr(w, repo, addr)
-	} else if pkg != "" && repo != "" {
-		return h.renderPkgRepo(w, pkg, repo)
-	} else if pkg != "" {
-		return h.renderPkg(w, pkg)
-	} else if constraint != "" {
-		return h.renderConstraint(w, constraint)
-	} else if repo != "" {
-		return h.renderRepo(w, repo)
-	} else if cfg != "" {
-		return h.renderCfg(w, cfg)
-	} else {
-		h.renderLanding(w)
-	}
-
-	return nil
-}
-
-func (h *handler) renderAddr(w http.ResponseWriter, repo, addr string) error {
-	defer boilerplate(w)()
-
-	byAddr, ok := h.builds[repo]
-	if !ok {
-		return errorf(w, "no repo %q", repo)
-	}
-
-	build, ok := byAddr[addr]
-	if !ok {
-		return errorf(w, "no addr %q", addr)
-	}
-
-	fmt.Fprintf(w, "<h1>%s</h1>\n", repo)
-	fmt.Fprintf(w, "<h2>%s</h2>\n", addr)
-
-	cfgAddr := strings.ReplaceAll(addr, "apko_build", "data.apko_config")
-	if _, ok := h.configs[cfgAddr]; ok {
-		fmt.Fprintf(w, "<a href=/?cfg=%s>%s</a>\n", url.QueryEscape(cfgAddr), html.EscapeString(cfgAddr))
-	}
-
-	fmt.Fprintf(w, "<pre>\n")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(linkify(*build.config)); err != nil {
-		return errorf(w, "encode: %w", err)
-	}
-	fmt.Fprintf(w, "</pre>\n")
-
-	return nil
-}
-
-func linkify(ic types.ImageConfiguration) types.ImageConfiguration {
-	packages := slices.Clone(ic.Contents.Packages)
-	for i, pkg := range packages {
-		packages[i] = fmt.Sprintf("<a href=/?pkg=%s>%s</a>", url.QueryEscape(pkg), html.EscapeString(pkg))
-	}
-	ic.Contents.Packages = packages
-	return ic
-}
-
-func (h *handler) renderRepo(w http.ResponseWriter, repo string) error {
-	defer boilerplate(w)()
-
-	fmt.Fprintf(w, "<h1>%s</h1>\n", repo)
-	fmt.Fprintf(w, "<ul>\n")
-	byAddr, ok := h.builds[repo]
-	if !ok {
-		return errorf(w, "no repo %q", repo)
-	}
-	for _, addr := range slices.Sorted(maps.Keys(byAddr)) {
-		href := fmt.Sprintf("/?repo=%s&addr=%s", url.QueryEscape(repo), url.QueryEscape(addr))
-		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
-	}
-	fmt.Fprintf(w, "</ul>\n")
-
-	return nil
-}
-
-func (h *handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
-	defer boilerplate(w)()
-
-	fmt.Fprintf(w, "<h1>%s</h1>\n", repo)
-	fmt.Fprintf(w, "<h2>containing %s</h2>\n", pkg)
-	fmt.Fprintf(w, "<ul>\n")
-	fromRepo, ok := h.builds[repo]
-	if !ok {
-		return errorf(w, "no repo %q", repo)
-	}
-	fromPkg, ok := h.byPackage[pkg]
-	if !ok {
-		return errorf(w, "no pkg %q", pkg)
-	}
-	for _, addr := range slices.Sorted(maps.Keys(fromRepo)) {
-		if _, ok := fromPkg[addr]; !ok {
-			continue
-		}
-		href := fmt.Sprintf("/?repo=%s&addr=%s", repo, url.QueryEscape(addr))
-		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
-	}
-	fmt.Fprintf(w, "</ul>\n")
-
-	return nil
-}
-
-func (h *handler) renderPkg(w http.ResponseWriter, pkg string) error {
-	defer boilerplate(w)()
-
-	fmt.Fprintf(w, "<h1>Images containing %s</h1>\n", pkg)
-	fmt.Fprintf(w, "<ul>\n")
-	fromPkg, ok := h.byPackage[pkg]
-	if !ok {
-		return errorf(w, "no pkg %q", pkg)
-	}
-
-	byRepo := map[string]struct{}{}
-	for _, cfg := range fromPkg {
-		byRepo[cfg.repo] = struct{}{}
-	}
-	for _, repo := range slices.Sorted(maps.Keys(byRepo)) {
-		href := fmt.Sprintf("/?repo=%s&pkg=%s", url.QueryEscape(repo), url.QueryEscape(pkg))
-		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(repo))
-	}
-	fmt.Fprintf(w, "</ul>\n")
-
-	return nil
-}
-
-func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
-	defer boilerplate(w)()
-
-	config, ok := h.configs[addr]
-	if !ok {
-		return errorf(w, "no addr %q", addr)
-	}
-
-	fmt.Fprintf(w, "<h1>%s</h1>\n", addr)
-
-	buildAddr := strings.ReplaceAll(addr, "data.apko_config", "apko_build")
-	if repo, ok := h.repoByAddr[buildAddr]; ok {
-		fmt.Fprintf(w, "<a href=/?repo=%s&addr=%s>%s</a>\n", url.QueryEscape(repo), url.QueryEscape(buildAddr), html.EscapeString(buildAddr))
-	}
-
-	fmt.Fprintf(w, "<pre>\n")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(config.config); err != nil {
-		return errorf(w, "encode: %w", err)
-	}
-	fmt.Fprintf(w, "</pre>\n")
-
-	return nil
-}
-
-func (h *handler) renderConstraint(w http.ResponseWriter, constraint string) error {
-	defer boilerplate(w)()
-
-	fmt.Fprintf(w, "<h1>Configs containing %s</h1>\n", constraint)
-	fmt.Fprintf(w, "<ul>\n")
-	fromConstraint, ok := h.byConstraint[constraint]
-	if !ok {
-		return errorf(w, "no constraint %q", constraint)
-	}
-
-	for _, addr := range slices.Sorted(maps.Keys(fromConstraint)) {
-		href := fmt.Sprintf("/?cfg=%s", url.QueryEscape(addr))
-		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
-	}
-	fmt.Fprintf(w, "</ul>\n")
-
-	return nil
-}
-
-func (h *handler) renderImages(w http.ResponseWriter) error {
-	defer boilerplate(w)()
-
-	fmt.Fprintf(w, "<h1>Images</h1>\n")
-	fmt.Fprintf(w, "<ul>\n")
-	for _, repo := range slices.Sorted(maps.Keys(h.builds)) {
-		href := fmt.Sprintf("/?repo=%s", url.QueryEscape(repo))
-		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(repo))
-	}
-	fmt.Fprintf(w, "</ul>\n")
-
-	return nil
-}
-
-func (h *handler) renderPackages(w http.ResponseWriter) error {
-	defer boilerplate(w)()
-
-	fmt.Fprintf(w, "<h1>Packages</h1>\n")
-	fmt.Fprintf(w, "<ul>\n")
-	for _, pkg := range slices.Sorted(maps.Keys(h.byPackage)) {
-		href := fmt.Sprintf("/?pkg=%s", url.QueryEscape(pkg))
-		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(pkg))
-	}
-	fmt.Fprintf(w, "</ul>\n")
-
-	return nil
-}
-
-func (h *handler) renderConfigs(w http.ResponseWriter) error {
-	defer boilerplate(w)()
-
-	fmt.Fprintf(w, "<h1>Configs</h1>\n")
-	fmt.Fprintf(w, "<ul>\n")
-	for _, addr := range slices.Sorted(maps.Keys(h.configs)) {
-		href := fmt.Sprintf("/?cfg=%s", url.QueryEscape(addr))
-		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
-	}
-	fmt.Fprintf(w, "</ul>\n")
-
-	return nil
-}
-
-func (h *handler) renderConstraints(w http.ResponseWriter) error {
-	defer boilerplate(w)()
-
-	fmt.Fprintf(w, "<h1>Constraints</h1>\n")
-	fmt.Fprintf(w, "<ul>\n")
-	for _, pkg := range slices.Sorted(maps.Keys(h.byConstraint)) {
-		href := fmt.Sprintf("/?constraint=%s", url.QueryEscape(pkg))
-		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(pkg))
-	}
-	fmt.Fprintf(w, "</ul>\n")
-
-	return nil
-}
-
-func (h *handler) renderLanding(w http.ResponseWriter) {
-	defer boilerplate(w)()
-
-	fmt.Fprintf(w, "<h1>Plan</h1>\n")
-	fmt.Fprintf(w, "<p><a href=%q>Images (%d)</a></p>\n", "images", len(h.builds))
-	fmt.Fprintf(w, "<p><a href=%q>Packages (%d)</a></p>\n", "packages", len(h.byPackage))
-	fmt.Fprintf(w, "<p><a href=%q>Configs (%d)</a></p>\n", "configs", len(h.configs))
-	fmt.Fprintf(w, "<p><a href=%q>Constraints (%d)</a></p>\n", "constraints", len(h.byConstraint))
 }
 
 func (h *handler) walkModules(m *tfjson.StateModule) error {
@@ -519,11 +235,6 @@ func (h *handler) walkModules(m *tfjson.StateModule) error {
 			}
 
 			h.config(r.Address, &ic)
-		} else {
-			_, ok := r.AttributeValues["config_contents"]
-			if ok {
-				log.Printf("config_contents in %q", r.Type)
-			}
 		}
 	}
 
@@ -532,6 +243,427 @@ func (h *handler) walkModules(m *tfjson.StateModule) error {
 			return err
 		}
 	}
+
+	return nil
+}
+
+func (h *handler) build(repo, addr string, ic *types.ImageConfiguration) {
+	byAddr, ok := h.byRepo[repo]
+	if !ok {
+		byAddr = map[string]*imageBuild{}
+	}
+
+	cfg := &imageBuild{
+		repo:   repo,
+		addr:   addr,
+		config: ic,
+	}
+
+	byAddr[addr] = cfg
+	h.builds[addr] = cfg
+
+	h.byRepo[repo] = byAddr
+
+	h.repoByAddr[addr] = repo
+
+	for _, pkg := range ic.Contents.Packages {
+		byAddr, ok := h.byPackage[pkg]
+		if !ok {
+			byAddr = map[string]*imageBuild{}
+		}
+		byAddr[addr] = cfg
+
+		h.byPackage[pkg] = byAddr
+	}
+}
+
+func (h *handler) config(addr string, ic *types.ImageConfiguration) {
+	cfg := &imageConfig{
+		addr:   addr,
+		config: ic,
+	}
+
+	h.configs[addr] = cfg
+
+	for _, pkg := range ic.Contents.Packages {
+		byAddr, ok := h.byConstraint[pkg]
+		if !ok {
+			byAddr = map[string]*imageConfig{}
+		}
+		byAddr[addr] = cfg
+
+		h.byConstraint[pkg] = byAddr
+	}
+}
+
+func (h *handler) renderLanding(w http.ResponseWriter) {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<p><a href=%q>Images (%d)</a></p>\n", "images", len(h.byRepo))
+	fmt.Fprintf(w, "<p><a href=%q>Builds (%d)</a></p>\n", "builds", len(h.builds))
+	fmt.Fprintf(w, "<p><a href=%q>Packages (%d)</a></p>\n", "packages", len(h.byPackage))
+	fmt.Fprintf(w, "<p><a href=%q>Configs (%d)</a></p>\n", "configs", len(h.configs))
+	fmt.Fprintf(w, "<p><a href=%q>Constraints (%d)</a></p>\n", "constraints", len(h.byConstraint))
+}
+
+func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
+	if r.URL.Path == "/images" {
+		return h.renderImages(w)
+	}
+
+	if r.URL.Path == "/builds" {
+		return h.renderBuilds(w)
+	}
+
+	if r.URL.Path == "/packages" {
+		return h.renderPackages(w)
+	}
+
+	if r.URL.Path == "/configs" {
+		return h.renderConfigs(w)
+	}
+
+	if r.URL.Path == "/constraints" {
+		return h.renderConstraints(w)
+	}
+
+	if r.URL.Path != "/" {
+		return nil
+	}
+
+	qs := r.URL.Query()
+	addr := qs.Get("addr")
+	repo := qs.Get("repo")
+	pkg := qs.Get("pkg")
+	cfg := qs.Get("cfg")
+	constraint := qs.Get("constraint")
+
+	if addr != "" {
+		return h.renderAddr(w, repo, addr)
+	} else if pkg != "" && repo != "" {
+		return h.renderPkgRepo(w, pkg, repo)
+	} else if pkg != "" {
+		return h.renderPkg(w, pkg)
+	} else if constraint != "" {
+		return h.renderConstraint(w, constraint)
+	} else if repo != "" {
+		return h.renderRepo(w, repo)
+	} else if cfg != "" {
+		return h.renderCfg(w, cfg)
+	} else {
+		h.renderLanding(w)
+	}
+
+	return nil
+}
+
+func (h *handler) renderAddr(w http.ResponseWriter, repo, addr string) error {
+	defer boilerplate(w)()
+
+	if repo == "" {
+		repo = h.repoByAddr[addr]
+	}
+
+	byAddr, ok := h.byRepo[repo]
+	if !ok {
+		return errorf(w, "no repo %q", repo)
+	}
+
+	build, ok := byAddr[addr]
+	if !ok {
+		return errorf(w, "no addr %q", addr)
+	}
+
+	fmt.Fprintf(w, "<h2>%s</h2>\n", repo)
+	fmt.Fprintf(w, "<h3>%s</h3>\n", addr)
+
+	cfgAddr := strings.ReplaceAll(addr, "apko_build", "data.apko_config")
+	if _, ok := h.configs[cfgAddr]; ok {
+		fmt.Fprintf(w, "<a href=/?cfg=%s>%s</a>\n", url.QueryEscape(cfgAddr), html.EscapeString(cfgAddr))
+	}
+
+	fmt.Fprintf(w, "<pre>\n")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(linkify(*build.config, "pkg")); err != nil {
+		return errorf(w, "encode: %w", err)
+	}
+	fmt.Fprintf(w, "</pre>\n")
+
+	return nil
+}
+
+func linkify(ic types.ImageConfiguration, page string) types.ImageConfiguration {
+	packages := slices.Clone(ic.Contents.Packages)
+	for i, pkg := range packages {
+		packages[i] = fmt.Sprintf("<a href=/?%s=%s>%s</a>", page, url.QueryEscape(pkg), html.EscapeString(pkg))
+	}
+	ic.Contents.Packages = packages
+	return ic
+}
+
+func (h *handler) renderRepo(w http.ResponseWriter, repo string) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h2>%s</h2>\n", repo)
+	fmt.Fprintf(w, "<ul>\n")
+	byAddr, ok := h.byRepo[repo]
+	if !ok {
+		return errorf(w, "no repo %q", repo)
+	}
+	for _, addr := range slices.Sorted(maps.Keys(byAddr)) {
+		href := fmt.Sprintf("/?repo=%s&addr=%s", url.QueryEscape(repo), url.QueryEscape(addr))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
+func (h *handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h2>%s</h2>\n", repo)
+	fmt.Fprintf(w, "<h3>containing %s</h3>\n", pkg)
+	fmt.Fprintf(w, "<ul>\n")
+	fromRepo, ok := h.byRepo[repo]
+	if !ok {
+		return errorf(w, "no repo %q", repo)
+	}
+	fromPkg, ok := h.byPackage[pkg]
+	if !ok {
+		return errorf(w, "no pkg %q", pkg)
+	}
+	for _, addr := range slices.Sorted(maps.Keys(fromRepo)) {
+		if _, ok := fromPkg[addr]; !ok {
+			continue
+		}
+		href := fmt.Sprintf("/?repo=%s&addr=%s", repo, url.QueryEscape(addr))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
+func (h *handler) renderPkg(w http.ResponseWriter, pkg string) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h2>Images containing %s</h2>\n", pkg)
+	fmt.Fprintf(w, "<p>This is every repo containing a apko_build.config with a packages field containing %q.</p>\n", pkg)
+	fmt.Fprintf(w, "<ul>\n")
+	fromPkg, ok := h.byPackage[pkg]
+	if !ok {
+		return errorf(w, "no pkg %q", pkg)
+	}
+
+	byRepo := map[string]struct{}{}
+	for _, cfg := range fromPkg {
+		byRepo[cfg.repo] = struct{}{}
+	}
+	for _, repo := range slices.Sorted(maps.Keys(byRepo)) {
+		href := fmt.Sprintf("/?repo=%s&pkg=%s", url.QueryEscape(repo), url.QueryEscape(pkg))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(repo))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
+func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
+	defer boilerplate(w)()
+
+	config, ok := h.configs[addr]
+	if !ok {
+		return errorf(w, "no addr %q", addr)
+	}
+
+	fmt.Fprintf(w, "<h2>%s</h2>\n", addr)
+
+	cfg := *config.config
+
+	buildAddr := strings.ReplaceAll(addr, "data.apko_config", "apko_build")
+	if build, ok := h.builds[buildAddr]; ok {
+		fmt.Fprintf(w, "<a href=/?addr=%s>%s</a>\n", url.QueryEscape(buildAddr), html.EscapeString(buildAddr))
+
+		// Defensive copy to avoid mutating the build.
+		copied := types.ImageConfiguration{}
+		if err := build.config.MergeInto(&copied); err != nil {
+			return errorf(w, "copying %s: %w", buildAddr, err)
+		}
+
+		// Carry over packages from apko_config.
+		copied.Contents.Packages = cfg.Contents.Packages
+
+		// Add global extra packages at apko provider level.
+		copied.Contents.Packages = append(copied.Contents.Packages, h.extraPackages...)
+
+		cfg = copied
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+
+	if err := enc.Encode(cfg); err != nil {
+		return errorf(w, "encode: %w", err)
+	}
+
+	// For Jason.
+	fmt.Fprintf(w, `<script>
+	function updateClipboard() {
+		const button = document.getElementById('button');
+		var text = %q;
+		navigator.clipboard.writeText(text).then(
+			() => {
+				button.textContent = 'Copied';
+			},
+			() => {
+				button.textContent = 'Failed';
+			},
+		);
+	}
+	</script>
+	`, buf.String())
+	fmt.Fprintf(w, "<p><button id=\"button\" onclick=\"updateClipboard()\">Copy</button></p>\n")
+
+	enc = json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+
+	fmt.Fprintf(w, "<pre>\n")
+	if err := enc.Encode(linkify(cfg, "constraint")); err != nil {
+		return errorf(w, "encode: %w", err)
+	}
+	fmt.Fprintf(w, "</pre>\n")
+
+	return nil
+}
+
+func (h *handler) renderConstraint(w http.ResponseWriter, constraint string) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h2>Configs containing %s</h2>\n", constraint)
+	fmt.Fprintf(w, "<p>This is every apko_config.config_contents with a packages field containing %q.</p>\n", constraint)
+	fmt.Fprintf(w, "<ul>\n")
+	fromConstraint, ok := h.byConstraint[constraint]
+	if !ok {
+		return errorf(w, "no constraint %q", constraint)
+	}
+
+	for _, addr := range slices.Sorted(maps.Keys(fromConstraint)) {
+		href := fmt.Sprintf("/?cfg=%s", url.QueryEscape(addr))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
+func (h *handler) renderImages(w http.ResponseWriter) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h2>Images</h2>\n")
+	fmt.Fprintf(w, "<p>This is every apko_build grouped by repo.</p>\n")
+	fmt.Fprintf(w, "<ul>\n")
+	for _, repo := range slices.Sorted(maps.Keys(h.byRepo)) {
+		href := fmt.Sprintf("/?repo=%s", url.QueryEscape(repo))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(repo))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
+func (h *handler) renderPackages(w http.ResponseWriter) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h2>Packages</h2>\n")
+	fmt.Fprintf(w, "<p>Every packages entry in a apko_build.config will show up here.</p>\n")
+	fmt.Fprintf(w, "<ul>\n")
+	for _, pkg := range slices.Sorted(maps.Keys(h.byPackage)) {
+		href := fmt.Sprintf("/?pkg=%s", url.QueryEscape(pkg))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(pkg))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	if len(h.duplicates) == 0 {
+		return nil
+	}
+
+	fmt.Fprintf(w, "<h3>Duplicates</h3>\n")
+	fmt.Fprintf(w, "<p>These packages have more than one version somewhere.</p>\n")
+	fmt.Fprintf(w, "<ul>\n")
+	for _, pkg := range slices.Sorted(maps.Keys(h.duplicates)) {
+		fmt.Fprintf(w, "<li>%s</li>\n", pkg)
+		fmt.Fprintf(w, "<ul>\n")
+		for v := range h.duplicates[pkg] {
+			href := fmt.Sprintf("/?pkg=%s", url.QueryEscape(pkg+"="+v))
+			fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(v))
+		}
+		fmt.Fprintf(w, "</ul>\n")
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
+func (h *handler) renderBuilds(w http.ResponseWriter) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h2>Builds</h2>\n")
+	fmt.Fprintf(w, "<p>These are the apko_build.config contents for every build.</p>\n")
+	fmt.Fprintf(w, "<ul>\n")
+	for _, addr := range slices.Sorted(maps.Keys(h.builds)) {
+		href := fmt.Sprintf("/?addr=%s", url.QueryEscape(addr))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
+func (h *handler) renderConfigs(w http.ResponseWriter) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h2>Configs</h2>\n")
+	fmt.Fprintf(w, "<p>These are the config_contents of every apko_config in the plan's prior_state.</p>\n")
+	fmt.Fprintf(w, "<ul>\n")
+	for _, addr := range slices.Sorted(maps.Keys(h.configs)) {
+		href := fmt.Sprintf("/?cfg=%s", url.QueryEscape(addr))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	if len(h.orphans) == 0 {
+		return nil
+	}
+
+	fmt.Fprintf(w, "<h3>Orphans</h3>\n")
+	fmt.Fprintf(w, "<p>These configs are not directly associated with a build.</p>\n")
+	fmt.Fprintf(w, "<ul>\n")
+	for _, addr := range h.orphans {
+		href := fmt.Sprintf("/?cfg=%s", url.QueryEscape(addr))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+	}
+	fmt.Fprintf(w, "</ul>\n")
+
+	return nil
+}
+
+func (h *handler) renderConstraints(w http.ResponseWriter) error {
+	defer boilerplate(w)()
+
+	fmt.Fprintf(w, "<h2>Constraints</h2>\n")
+	fmt.Fprintf(w, "<p>Every packages entry in apko_config.config_contents will show up here.</p>\n")
+	fmt.Fprintf(w, "<p>This will include most locked constraints as well thanks to dev variants.</p>\n")
+	fmt.Fprintf(w, "<ul>\n")
+	for _, pkg := range slices.Sorted(maps.Keys(h.byConstraint)) {
+		href := fmt.Sprintf("/?constraint=%s", url.QueryEscape(pkg))
+		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(pkg))
+	}
+	fmt.Fprintf(w, "</ul>\n")
 
 	return nil
 }
@@ -553,6 +685,7 @@ func boilerplate(w http.ResponseWriter) func() {
 }`)
 	fmt.Fprintf(w, "</style>\n")
 	fmt.Fprintf(w, "<body>\n")
+	fmt.Fprintf(w, "<h1><a href=%q>tfimages</a></h1>\n", "/")
 
 	return func() {
 		fmt.Fprintf(w, "</body>\n")
@@ -576,7 +709,7 @@ func runDiff(ctx context.Context, args []string) error {
 		h := handler{
 			repoByAddr:   map[string]string{},
 			configs:      map[string]*imageConfig{},
-			builds:       map[string]map[string]*imageBuild{},
+			byRepo:       map[string]map[string]*imageBuild{},
 			byPackage:    map[string]map[string]*imageBuild{},
 			byConstraint: map[string]map[string]*imageConfig{},
 		}
@@ -591,12 +724,12 @@ func runDiff(ctx context.Context, args []string) error {
 	lhs, rhs := hs[0], hs[1]
 
 	same := 0
-	for repo, lByAddr := range lhs.builds {
+	for repo, lByAddr := range lhs.byRepo {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		rByAddr := rhs.builds[repo]
+		rByAddr := rhs.byRepo[repo]
 
 		for addr, lcfg := range lByAddr {
 			rcfg := rByAddr[addr]
