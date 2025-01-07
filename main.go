@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"chainguard.dev/apko/pkg/build/types"
-	"github.com/google/go-cmp/cmp"
 	tfjson "github.com/hashicorp/terraform-json"
 	"github.com/skratchdot/open-golang/open"
 	"golang.org/x/sync/errgroup"
@@ -37,90 +36,18 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	if len(os.Args) == 3 {
-		return runDiff(ctx, os.Args[1:])
-	}
-
 	log.Printf("decoding plan")
 	var p tfjson.Plan
 	if err := json.NewDecoder(os.Stdin).Decode(&p); err != nil {
 		return err
 	}
 
-	h := handler{
-		repoByAddr:   map[string]string{},
-		configs:      map[string]*imageConfig{},
-		byRepo:       map[string]map[string]*imageBuild{},
-		builds:       map[string]*imageBuild{},
-		byPackage:    map[string]map[string]*imageBuild{},
-		byConstraint: map[string]map[string]*imageConfig{},
-	}
-
-	if apkoConfig, ok := p.Config.ProviderConfigs["apko"]; ok {
-		if exprs, ok := apkoConfig.Expressions["extra_packages"]; ok {
-			cv := exprs.ConstantValue
-			list, ok := cv.([]any)
-			if !ok {
-				return fmt.Errorf("extra_packages is a %T", cv)
-			}
-
-			for _, el := range list {
-				if pkg, ok := el.(string); ok {
-					h.extraPackages = append(h.extraPackages, pkg)
-				} else {
-					return fmt.Errorf("extra_packages element is a %T", el)
-				}
-			}
-		}
-	}
-
-	log.Printf("walking planned values")
-	if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
-		return err
-	}
-	log.Printf("walking prior state")
-	if err := h.walkModules(p.PriorState.Values.RootModule); err != nil {
+	h, err := New(p, "")
+	if err != nil {
 		return err
 	}
 
-	log.Printf("%d configs, %d builds", len(h.configs), len(h.builds))
-
-	h.orphans = make([]string, 0, len(h.configs)-len(h.builds))
-
-	for addr := range h.configs {
-		buildAddr := strings.ReplaceAll(addr, "data.apko_config", "apko_build")
-		if _, ok := h.builds[buildAddr]; !ok {
-			h.orphans = append(h.orphans, addr)
-		}
-	}
-
-	slices.Sort(h.orphans)
-
-	versions := map[string]map[string]any{}
-	for pkg := range h.byPackage {
-		p, v, ok := strings.Cut(pkg, "=")
-		if !ok {
-			panic(pkg)
-		}
-		if _, ok := versions[p]; !ok {
-			versions[p] = map[string]any{}
-		}
-		versions[p][v] = struct{}{}
-	}
-
-	h.duplicates = map[string]map[string]any{}
-	for p, vs := range versions {
-		if len(vs) != 1 {
-			h.duplicates[p] = vs
-		}
-	}
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s", r.Method, r.URL.String())
-		if err := h.handle(w, r); err != nil {
-			log.Printf("error: %s", err)
-		}
-	})
+	http.HandleFunc("/", h.ServeHTTP)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -152,17 +79,112 @@ func run(ctx context.Context) error {
 	return g.Wait()
 }
 
+func New(p tfjson.Plan, root string) (http.Handler, error) {
+	h := &handler{
+		root:         root,
+		repoByAddr:   map[string]string{},
+		configs:      map[string]*imageConfig{},
+		byRepo:       map[string]map[string]*imageBuild{},
+		builds:       map[string]*imageBuild{},
+		byPackage:    map[string]map[string]*imageBuild{},
+		byConstraint: map[string]map[string]*imageConfig{},
+	}
+
+	if apkoConfig, ok := p.Config.ProviderConfigs["apko"]; ok {
+		if exprs, ok := apkoConfig.Expressions["extra_packages"]; ok {
+			cv := exprs.ConstantValue
+			list, ok := cv.([]any)
+			if !ok {
+				return nil, fmt.Errorf("extra_packages is a %T", cv)
+			}
+
+			for _, el := range list {
+				if pkg, ok := el.(string); ok {
+					h.extraPackages = append(h.extraPackages, pkg)
+				} else {
+					return nil, fmt.Errorf("extra_packages element is a %T", el)
+				}
+			}
+		}
+	}
+
+	log.Printf("walking planned values")
+	if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
+		return nil, err
+	}
+
+	log.Printf("walking prior state")
+	if err := h.walkModules(p.PriorState.Values.RootModule); err != nil {
+		return nil, err
+	}
+
+	log.Printf("%d configs, %d builds", len(h.configs), len(h.builds))
+
+	h.versionGetters = make([]string, 0, len(h.configs)-len(h.builds))
+	h.orphans = make([]string, 0, len(h.configs)-len(h.builds))
+
+	for addr, cfg := range h.configs {
+		buildAddr := strings.ReplaceAll(addr, "data.apko_config", "apko_build")
+		if _, ok := h.builds[buildAddr]; !ok {
+			if len(cfg.config.Contents.Packages) == 1 {
+				// TODO: This conditional isn't really sufficient.
+				h.versionGetters = append(h.versionGetters, addr)
+			} else {
+				h.orphans = append(h.orphans, addr)
+			}
+		}
+	}
+
+	slices.Sort(h.versionGetters)
+	slices.Sort(h.orphans)
+
+	versions := map[string]map[string]any{}
+	for pkg := range h.byPackage {
+		p, v, ok := strings.Cut(pkg, "=")
+		if !ok {
+			panic(pkg)
+		}
+		if _, ok := versions[p]; !ok {
+			versions[p] = map[string]any{}
+		}
+		versions[p][v] = struct{}{}
+	}
+
+	h.duplicates = map[string]map[string]any{}
+	for p, vs := range versions {
+		if len(vs) != 1 {
+			h.duplicates[p] = vs
+		}
+	}
+
+	return h, nil
+}
+
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Printf("%s %s", r.Method, r.URL.String())
+	if err := h.handle(w, r); err != nil {
+		log.Printf("error: %s", err)
+	}
+}
+
 type handler struct {
-	configs      map[string]*imageConfig
-	byConstraint map[string]map[string]*imageConfig
-	builds       map[string]*imageBuild
-	byRepo       map[string]map[string]*imageBuild
-	byPackage    map[string]map[string]*imageBuild
-	repoByAddr   map[string]string
-	orphans      []string
-	duplicates   map[string]map[string]any
+	root string
+
+	configs        map[string]*imageConfig
+	byConstraint   map[string]map[string]*imageConfig
+	builds         map[string]*imageBuild
+	byRepo         map[string]map[string]*imageBuild
+	byPackage      map[string]map[string]*imageBuild
+	repoByAddr     map[string]string
+	orphans        []string
+	versionGetters []string
+	duplicates     map[string]map[string]any
 
 	extraPackages []string
+}
+
+func (h *handler) ref(format string, a ...any) string {
+	return fmt.Sprintf("%s/%s", h.root, fmt.Sprintf(format, a...))
 }
 
 type imageBuild struct {
@@ -297,38 +319,43 @@ func (h *handler) config(addr string, ic *types.ImageConfiguration) {
 }
 
 func (h *handler) renderLanding(w http.ResponseWriter) {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
-	fmt.Fprintf(w, "<p><a href=%q>Images (%d)</a></p>\n", "images", len(h.byRepo))
-	fmt.Fprintf(w, "<p><a href=%q>Builds (%d)</a></p>\n", "builds", len(h.builds))
-	fmt.Fprintf(w, "<p><a href=%q>Packages (%d)</a></p>\n", "packages", len(h.byPackage))
-	fmt.Fprintf(w, "<p><a href=%q>Configs (%d)</a></p>\n", "configs", len(h.configs))
-	fmt.Fprintf(w, "<p><a href=%q>Constraints (%d)</a></p>\n", "constraints", len(h.byConstraint))
+	fmt.Fprintf(w, "<p><a href=%q>Images (%d)</a></p>\n", h.ref("images"), len(h.byRepo))
+	fmt.Fprintf(w, "<p><a href=%q>Builds (%d)</a></p>\n", h.ref("builds"), len(h.builds))
+	fmt.Fprintf(w, "<p><a href=%q>Packages (%d)</a></p>\n", h.ref("packages"), len(h.byPackage))
+	fmt.Fprintf(w, "<p><a href=%q>Configs (%d)</a></p>\n", h.ref("configs"), len(h.configs))
+	fmt.Fprintf(w, "<p><a href=%q>Constraints (%d)</a></p>\n", h.ref("constraints"), len(h.byConstraint))
+}
+
+func (h *handler) match(r *http.Request, p string) bool {
+	return r.URL.Path == h.root+"/"+p
 }
 
 func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
-	if r.URL.Path == "/images" {
+	if h.match(r, "images") {
 		return h.renderImages(w)
 	}
 
-	if r.URL.Path == "/builds" {
+	if h.match(r, "builds") {
 		return h.renderBuilds(w)
 	}
 
-	if r.URL.Path == "/packages" {
+	if h.match(r, "packages") {
 		return h.renderPackages(w)
 	}
 
-	if r.URL.Path == "/configs" {
+	if h.match(r, "configs") {
 		return h.renderConfigs(w)
 	}
 
-	if r.URL.Path == "/constraints" {
+	if h.match(r, "constraints") {
 		return h.renderConstraints(w)
 	}
 
-	if r.URL.Path != "/" {
-		return nil
+	if !h.match(r, "") {
+		defer h.boilerplate(w)()
+		return errorf(w, "unexpected path: %q", r.URL.Path)
 	}
 
 	qs := r.URL.Query()
@@ -358,7 +385,7 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *handler) renderAddr(w http.ResponseWriter, repo, addr string) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
 	if repo == "" {
 		repo = h.repoByAddr[addr]
@@ -379,14 +406,15 @@ func (h *handler) renderAddr(w http.ResponseWriter, repo, addr string) error {
 
 	cfgAddr := strings.ReplaceAll(addr, "apko_build", "data.apko_config")
 	if _, ok := h.configs[cfgAddr]; ok {
-		fmt.Fprintf(w, "<a href=/?cfg=%s>%s</a>\n", url.QueryEscape(cfgAddr), html.EscapeString(cfgAddr))
+		href := h.ref("?cfg=%s", url.QueryEscape(cfgAddr))
+		fmt.Fprintf(w, "<a href=%q>%s</a>\n", href, html.EscapeString(cfgAddr))
 	}
 
 	fmt.Fprintf(w, "<pre>\n")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(linkify(*build.config, "pkg")); err != nil {
+	if err := enc.Encode(h.linkify(*build.config, "pkg")); err != nil {
 		return errorf(w, "encode: %w", err)
 	}
 	fmt.Fprintf(w, "</pre>\n")
@@ -394,17 +422,18 @@ func (h *handler) renderAddr(w http.ResponseWriter, repo, addr string) error {
 	return nil
 }
 
-func linkify(ic types.ImageConfiguration, page string) types.ImageConfiguration {
+func (h *handler) linkify(ic types.ImageConfiguration, page string) types.ImageConfiguration {
 	packages := slices.Clone(ic.Contents.Packages)
 	for i, pkg := range packages {
-		packages[i] = fmt.Sprintf("<a href=/?%s=%s>%s</a>", page, url.QueryEscape(pkg), html.EscapeString(pkg))
+		href := h.ref("?%s=%s", page, url.QueryEscape(pkg))
+		packages[i] = fmt.Sprintf("<a href=%s>%s</a>", href, html.EscapeString(pkg)) // TODO: Why do we have to use %s for href here???
 	}
 	ic.Contents.Packages = packages
 	return ic
 }
 
 func (h *handler) renderRepo(w http.ResponseWriter, repo string) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
 	fmt.Fprintf(w, "<h2>%s</h2>\n", repo)
 	fmt.Fprintf(w, "<ul>\n")
@@ -413,7 +442,7 @@ func (h *handler) renderRepo(w http.ResponseWriter, repo string) error {
 		return errorf(w, "no repo %q", repo)
 	}
 	for _, addr := range slices.Sorted(maps.Keys(byAddr)) {
-		href := fmt.Sprintf("/?repo=%s&addr=%s", url.QueryEscape(repo), url.QueryEscape(addr))
+		href := h.ref("?repo=%s&addr=%s", url.QueryEscape(repo), url.QueryEscape(addr))
 		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
 	}
 	fmt.Fprintf(w, "</ul>\n")
@@ -422,7 +451,7 @@ func (h *handler) renderRepo(w http.ResponseWriter, repo string) error {
 }
 
 func (h *handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
 	fmt.Fprintf(w, "<h2>%s</h2>\n", repo)
 	fmt.Fprintf(w, "<h3>containing %s</h3>\n", pkg)
@@ -439,7 +468,7 @@ func (h *handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
 		if _, ok := fromPkg[addr]; !ok {
 			continue
 		}
-		href := fmt.Sprintf("/?repo=%s&addr=%s", repo, url.QueryEscape(addr))
+		href := h.ref("?repo=%s&addr=%s", repo, url.QueryEscape(addr))
 		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
 	}
 	fmt.Fprintf(w, "</ul>\n")
@@ -448,7 +477,7 @@ func (h *handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
 }
 
 func (h *handler) renderPkg(w http.ResponseWriter, pkg string) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
 	fmt.Fprintf(w, "<h2>Images containing %s</h2>\n", pkg)
 	fmt.Fprintf(w, "<p>This is every repo containing a apko_build.config with a packages field containing %q.</p>\n", pkg)
@@ -463,7 +492,7 @@ func (h *handler) renderPkg(w http.ResponseWriter, pkg string) error {
 		byRepo[cfg.repo] = struct{}{}
 	}
 	for _, repo := range slices.Sorted(maps.Keys(byRepo)) {
-		href := fmt.Sprintf("/?repo=%s&pkg=%s", url.QueryEscape(repo), url.QueryEscape(pkg))
+		href := h.ref("?repo=%s&pkg=%s", url.QueryEscape(repo), url.QueryEscape(pkg))
 		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(repo))
 	}
 	fmt.Fprintf(w, "</ul>\n")
@@ -472,7 +501,7 @@ func (h *handler) renderPkg(w http.ResponseWriter, pkg string) error {
 }
 
 func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
 	config, ok := h.configs[addr]
 	if !ok {
@@ -485,7 +514,8 @@ func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
 
 	buildAddr := strings.ReplaceAll(addr, "data.apko_config", "apko_build")
 	if build, ok := h.builds[buildAddr]; ok {
-		fmt.Fprintf(w, "<a href=/?addr=%s>%s</a>\n", url.QueryEscape(buildAddr), html.EscapeString(buildAddr))
+		href := h.ref("?addr=%s", url.QueryEscape(buildAddr))
+		fmt.Fprintf(w, "<a href=%q>%s</a>\n", href, html.EscapeString(buildAddr))
 
 		// Defensive copy to avoid mutating the build.
 		copied := types.ImageConfiguration{}
@@ -533,7 +563,7 @@ func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
 	enc.SetEscapeHTML(false)
 
 	fmt.Fprintf(w, "<pre>\n")
-	if err := enc.Encode(linkify(cfg, "constraint")); err != nil {
+	if err := enc.Encode(h.linkify(cfg, "constraint")); err != nil {
 		return errorf(w, "encode: %w", err)
 	}
 	fmt.Fprintf(w, "</pre>\n")
@@ -542,7 +572,7 @@ func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
 }
 
 func (h *handler) renderConstraint(w http.ResponseWriter, constraint string) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
 	fmt.Fprintf(w, "<h2>Configs containing %s</h2>\n", constraint)
 	fmt.Fprintf(w, "<p>This is every apko_config.config_contents with a packages field containing %q.</p>\n", constraint)
@@ -553,7 +583,7 @@ func (h *handler) renderConstraint(w http.ResponseWriter, constraint string) err
 	}
 
 	for _, addr := range slices.Sorted(maps.Keys(fromConstraint)) {
-		href := fmt.Sprintf("/?cfg=%s", url.QueryEscape(addr))
+		href := h.ref("?cfg=%s", url.QueryEscape(addr))
 		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
 	}
 	fmt.Fprintf(w, "</ul>\n")
@@ -562,13 +592,13 @@ func (h *handler) renderConstraint(w http.ResponseWriter, constraint string) err
 }
 
 func (h *handler) renderImages(w http.ResponseWriter) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
-	fmt.Fprintf(w, "<h2>Images</h2>\n")
+	fmt.Fprintf(w, "<h2>Images (%d)</h2>\n", len(h.byRepo))
 	fmt.Fprintf(w, "<p>This is every apko_build grouped by repo.</p>\n")
 	fmt.Fprintf(w, "<ul>\n")
 	for _, repo := range slices.Sorted(maps.Keys(h.byRepo)) {
-		href := fmt.Sprintf("/?repo=%s", url.QueryEscape(repo))
+		href := h.ref("?repo=%s", url.QueryEscape(repo))
 		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(repo))
 	}
 	fmt.Fprintf(w, "</ul>\n")
@@ -577,46 +607,48 @@ func (h *handler) renderImages(w http.ResponseWriter) error {
 }
 
 func (h *handler) renderPackages(w http.ResponseWriter) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
-	fmt.Fprintf(w, "<h2>Packages</h2>\n")
-	fmt.Fprintf(w, "<p>Every packages entry in a apko_build.config will show up here.</p>\n")
+	fmt.Fprintf(w, "<h2>Packages (%d)</h2>\n", len(h.byPackage))
+	fmt.Fprintf(w, "<details>")
+	fmt.Fprintf(w, "<summary>Every packages entry in a apko_build.config will show up here.</summary>\n")
 	fmt.Fprintf(w, "<ul>\n")
 	for _, pkg := range slices.Sorted(maps.Keys(h.byPackage)) {
-		href := fmt.Sprintf("/?pkg=%s", url.QueryEscape(pkg))
+		href := h.ref("?pkg=%s", url.QueryEscape(pkg))
 		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(pkg))
 	}
 	fmt.Fprintf(w, "</ul>\n")
+	fmt.Fprintf(w, "</details>")
 
-	if len(h.duplicates) == 0 {
-		return nil
-	}
-
-	fmt.Fprintf(w, "<h3>Duplicates</h3>\n")
-	fmt.Fprintf(w, "<p>These packages have more than one version somewhere.</p>\n")
-	fmt.Fprintf(w, "<ul>\n")
-	for _, pkg := range slices.Sorted(maps.Keys(h.duplicates)) {
-		fmt.Fprintf(w, "<li>%s</li>\n", pkg)
+	if len(h.duplicates) != 0 {
+		fmt.Fprintf(w, "<h3>Duplicates (%d)</h3>\n", len(h.duplicates))
+		fmt.Fprintf(w, "<details>")
+		fmt.Fprintf(w, "<summary>These packages have more than one version somewhere.</summary>\n")
 		fmt.Fprintf(w, "<ul>\n")
-		for v := range h.duplicates[pkg] {
-			href := fmt.Sprintf("/?pkg=%s", url.QueryEscape(pkg+"="+v))
-			fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(v))
+		for _, pkg := range slices.Sorted(maps.Keys(h.duplicates)) {
+			fmt.Fprintf(w, "<li>%s</li>\n", pkg)
+			fmt.Fprintf(w, "<ul>\n")
+			for v := range h.duplicates[pkg] {
+				href := h.ref("?pkg=%s", url.QueryEscape(pkg+"="+v))
+				fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(v))
+			}
+			fmt.Fprintf(w, "</ul>\n")
 		}
 		fmt.Fprintf(w, "</ul>\n")
+		fmt.Fprintf(w, "</details>")
 	}
-	fmt.Fprintf(w, "</ul>\n")
 
 	return nil
 }
 
 func (h *handler) renderBuilds(w http.ResponseWriter) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
-	fmt.Fprintf(w, "<h2>Builds</h2>\n")
+	fmt.Fprintf(w, "<h2>Builds (%d)</h2>\n", len(h.builds))
 	fmt.Fprintf(w, "<p>These are the apko_build.config contents for every build.</p>\n")
 	fmt.Fprintf(w, "<ul>\n")
 	for _, addr := range slices.Sorted(maps.Keys(h.builds)) {
-		href := fmt.Sprintf("/?addr=%s", url.QueryEscape(addr))
+		href := h.ref("?addr=%s", url.QueryEscape(addr))
 		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
 	}
 	fmt.Fprintf(w, "</ul>\n")
@@ -625,42 +657,57 @@ func (h *handler) renderBuilds(w http.ResponseWriter) error {
 }
 
 func (h *handler) renderConfigs(w http.ResponseWriter) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
-	fmt.Fprintf(w, "<h2>Configs</h2>\n")
-	fmt.Fprintf(w, "<p>These are the config_contents of every apko_config in the plan's prior_state.</p>\n")
+	fmt.Fprintf(w, "<h2>Configs (%d)</h2>\n", len(h.configs))
+	fmt.Fprintf(w, "<details>")
+	fmt.Fprintf(w, "<summary>These are the config_contents of every apko_config in the plan's prior_state.</summary>\n")
 	fmt.Fprintf(w, "<ul>\n")
 	for _, addr := range slices.Sorted(maps.Keys(h.configs)) {
-		href := fmt.Sprintf("/?cfg=%s", url.QueryEscape(addr))
+		href := h.ref("?cfg=%s", url.QueryEscape(addr))
 		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
 	}
 	fmt.Fprintf(w, "</ul>\n")
+	fmt.Fprintf(w, "</details>")
 
-	if len(h.orphans) == 0 {
-		return nil
+	if len(h.versionGetters) != 0 {
+		fmt.Fprintf(w, "<h3>Version Getters (%d)</h3>\n", len(h.versionGetters))
+		fmt.Fprintf(w, "<details>")
+		fmt.Fprintf(w, "<summary>These configs are not directly associated with a build and heuristically look like version getters.</summary>\n")
+		fmt.Fprintf(w, "<ul>\n")
+		for _, addr := range h.versionGetters {
+			href := h.ref("?cfg=%s", url.QueryEscape(addr))
+			fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+		}
+		fmt.Fprintf(w, "</ul>\n")
+		fmt.Fprintf(w, "</details>")
 	}
 
-	fmt.Fprintf(w, "<h3>Orphans</h3>\n")
-	fmt.Fprintf(w, "<p>These configs are not directly associated with a build.</p>\n")
-	fmt.Fprintf(w, "<ul>\n")
-	for _, addr := range h.orphans {
-		href := fmt.Sprintf("/?cfg=%s", url.QueryEscape(addr))
-		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+	if len(h.orphans) != 0 {
+		fmt.Fprintf(w, "<h3>Orphans (%d)</h3>\n", len(h.orphans))
+		fmt.Fprintf(w, "<details>")
+		fmt.Fprintf(w, "<summary>These configs are not directly associated with a build.</summary>\n")
+		fmt.Fprintf(w, "<ul>\n")
+		for _, addr := range h.orphans {
+			href := h.ref("?cfg=%s", url.QueryEscape(addr))
+			fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(addr))
+		}
+		fmt.Fprintf(w, "</ul>\n")
+		fmt.Fprintf(w, "</details>")
 	}
-	fmt.Fprintf(w, "</ul>\n")
 
 	return nil
 }
 
 func (h *handler) renderConstraints(w http.ResponseWriter) error {
-	defer boilerplate(w)()
+	defer h.boilerplate(w)()
 
-	fmt.Fprintf(w, "<h2>Constraints</h2>\n")
+	fmt.Fprintf(w, "<h2>Constraints (%d)</h2>\n", len(h.byConstraint))
 	fmt.Fprintf(w, "<p>Every packages entry in apko_config.config_contents will show up here.</p>\n")
 	fmt.Fprintf(w, "<p>This will include most locked constraints as well thanks to dev variants.</p>\n")
 	fmt.Fprintf(w, "<ul>\n")
 	for _, pkg := range slices.Sorted(maps.Keys(h.byConstraint)) {
-		href := fmt.Sprintf("/?constraint=%s", url.QueryEscape(pkg))
+		href := h.ref("?constraint=%s", url.QueryEscape(pkg))
 		fmt.Fprintf(w, "<li><a href=%q>%s</a></li>\n", href, html.EscapeString(pkg))
 	}
 	fmt.Fprintf(w, "</ul>\n")
@@ -674,7 +721,7 @@ func errorf(w http.ResponseWriter, msg string, args ...any) error {
 	return err
 }
 
-func boilerplate(w http.ResponseWriter) func() {
+func (h *handler) boilerplate(w http.ResponseWriter) func() {
 	fmt.Fprintf(w, "<html>\n")
 	fmt.Fprintf(w, "<style>\n")
 	fmt.Fprintf(w, `body {
@@ -685,78 +732,10 @@ func boilerplate(w http.ResponseWriter) func() {
 }`)
 	fmt.Fprintf(w, "</style>\n")
 	fmt.Fprintf(w, "<body>\n")
-	fmt.Fprintf(w, "<h1><a href=%q>tfimages</a></h1>\n", "/")
+	fmt.Fprintf(w, "<h1><a href=%q>tfimages</a></h1>\n", h.ref(""))
 
 	return func() {
 		fmt.Fprintf(w, "</body>\n")
 		fmt.Fprintf(w, "</html>\n")
 	}
-}
-
-func runDiff(ctx context.Context, args []string) error {
-	var hs []handler
-	for _, arg := range args {
-		log.Printf("decoding plan")
-		f, err := os.Open(arg)
-		if err != nil {
-			return err
-		}
-		var p tfjson.Plan
-		if err := json.NewDecoder(f).Decode(&p); err != nil {
-			return err
-		}
-
-		h := handler{
-			repoByAddr:   map[string]string{},
-			configs:      map[string]*imageConfig{},
-			byRepo:       map[string]map[string]*imageBuild{},
-			byPackage:    map[string]map[string]*imageBuild{},
-			byConstraint: map[string]map[string]*imageConfig{},
-		}
-
-		log.Printf("walking planned values")
-		if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
-			return err
-		}
-		hs = append(hs, h)
-	}
-
-	lhs, rhs := hs[0], hs[1]
-
-	same := 0
-	for repo, lByAddr := range lhs.byRepo {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		rByAddr := rhs.byRepo[repo]
-
-		for addr, lcfg := range lByAddr {
-			rcfg := rByAddr[addr]
-
-			if rcfg == nil {
-				if same != 0 {
-					fmt.Printf("%d same\n", same)
-				}
-				same = 0
-				fmt.Printf("missing rcfg for %q\n", addr)
-				continue
-			}
-
-			if diff := cmp.Diff(lcfg.config, rcfg.config); diff != "" {
-				if same != 0 {
-					fmt.Printf("%d same\n", same)
-				}
-				same = 0
-				fmt.Printf("diff %q\n", addr)
-				fmt.Printf("%s\n\n", diff)
-			} else {
-				same++
-			}
-		}
-	}
-	if same != 0 {
-		fmt.Printf("%d same\n", same)
-	}
-	return nil
 }
