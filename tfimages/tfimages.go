@@ -257,8 +257,6 @@ func (h *handler) config(addr string, ic *types.ImageConfiguration) {
 }
 
 func (h *handler) renderLanding(w http.ResponseWriter) {
-	defer h.boilerplate(w)()
-
 	fmt.Fprintf(w, "<p><a href=%q>Images (%d)</a></p>\n", h.ref("images"), len(h.byRepo))
 	fmt.Fprintf(w, "<p><a href=%q>Builds (%d)</a></p>\n", h.ref("builds"), len(h.builds))
 	fmt.Fprintf(w, "<p><a href=%q>Packages (%d)</a></p>\n", h.ref("packages"), len(h.byPackage))
@@ -292,7 +290,6 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if !h.match(r, "") {
-		defer h.boilerplate(w)()
 		return errorf(w, "unexpected path: %q", r.URL.Path)
 	}
 
@@ -323,8 +320,6 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *handler) renderAddr(w http.ResponseWriter, repo, addr string) error {
-	defer h.boilerplate(w)()
-
 	if repo == "" {
 		repo = h.repoByAddr[addr]
 	}
@@ -371,8 +366,6 @@ func (h *handler) linkify(ic types.ImageConfiguration, page string) types.ImageC
 }
 
 func (h *handler) renderRepo(w http.ResponseWriter, repo string) error {
-	defer h.boilerplate(w)()
-
 	fmt.Fprintf(w, "<h2>%s</h2>\n", repo)
 	fmt.Fprintf(w, "<ul>\n")
 	byAddr, ok := h.byRepo[repo]
@@ -389,8 +382,6 @@ func (h *handler) renderRepo(w http.ResponseWriter, repo string) error {
 }
 
 func (h *handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
-	defer h.boilerplate(w)()
-
 	fmt.Fprintf(w, "<h2>%s</h2>\n", repo)
 	fmt.Fprintf(w, "<h3>containing %s</h3>\n", pkg)
 	fmt.Fprintf(w, "<ul>\n")
@@ -415,8 +406,6 @@ func (h *handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
 }
 
 func (h *handler) renderPkg(w http.ResponseWriter, pkg string) error {
-	defer h.boilerplate(w)()
-
 	fmt.Fprintf(w, "<h2>Images containing %s</h2>\n", pkg)
 	fmt.Fprintf(w, "<p>This is every repo containing a apko_build.config with a packages field containing %q.</p>\n", pkg)
 	fmt.Fprintf(w, "<ul>\n")
@@ -439,8 +428,6 @@ func (h *handler) renderPkg(w http.ResponseWriter, pkg string) error {
 }
 
 func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
-	defer h.boilerplate(w)()
-
 	config, ok := h.configs[addr]
 	if !ok {
 		return errorf(w, "no addr %q", addr)
@@ -510,8 +497,6 @@ func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
 }
 
 func (h *handler) renderConstraint(w http.ResponseWriter, constraint string) error {
-	defer h.boilerplate(w)()
-
 	fmt.Fprintf(w, "<h2>Configs containing %s</h2>\n", constraint)
 	fmt.Fprintf(w, "<p>This is every apko_config.config_contents with a packages field containing %q.</p>\n", constraint)
 	fmt.Fprintf(w, "<ul>\n")
@@ -530,8 +515,6 @@ func (h *handler) renderConstraint(w http.ResponseWriter, constraint string) err
 }
 
 func (h *handler) renderImages(w http.ResponseWriter) error {
-	defer h.boilerplate(w)()
-
 	fmt.Fprintf(w, "<h2>Images (%d)</h2>\n", len(h.byRepo))
 	fmt.Fprintf(w, "<p>This is every apko_build grouped by repo.</p>\n")
 	fmt.Fprintf(w, "<ul>\n")
@@ -545,8 +528,6 @@ func (h *handler) renderImages(w http.ResponseWriter) error {
 }
 
 func (h *handler) renderPackages(w http.ResponseWriter) error {
-	defer h.boilerplate(w)()
-
 	fmt.Fprintf(w, "<h2>Packages (%d)</h2>\n", len(h.byPackage))
 	fmt.Fprintf(w, "<details>")
 	fmt.Fprintf(w, "<summary>Every packages entry in a apko_build.config will show up here.</summary>\n")
@@ -580,8 +561,6 @@ func (h *handler) renderPackages(w http.ResponseWriter) error {
 }
 
 func (h *handler) renderBuilds(w http.ResponseWriter) error {
-	defer h.boilerplate(w)()
-
 	fmt.Fprintf(w, "<h2>Builds (%d)</h2>\n", len(h.builds))
 	fmt.Fprintf(w, "<p>These are the apko_build.config contents for every build.</p>\n")
 	fmt.Fprintf(w, "<ul>\n")
@@ -595,8 +574,6 @@ func (h *handler) renderBuilds(w http.ResponseWriter) error {
 }
 
 func (h *handler) renderConfigs(w http.ResponseWriter) error {
-	defer h.boilerplate(w)()
-
 	fmt.Fprintf(w, "<h2>Configs (%d)</h2>\n", len(h.configs))
 	fmt.Fprintf(w, "<details>")
 	fmt.Fprintf(w, "<summary>These are the config_contents of every apko_config in the plan's prior_state.</summary>\n")
@@ -638,8 +615,6 @@ func (h *handler) renderConfigs(w http.ResponseWriter) error {
 }
 
 func (h *handler) renderConstraints(w http.ResponseWriter) error {
-	defer h.boilerplate(w)()
-
 	fmt.Fprintf(w, "<h2>Constraints (%d)</h2>\n", len(h.byConstraint))
 	fmt.Fprintf(w, "<p>Every packages entry in apko_config.config_contents will show up here.</p>\n")
 	fmt.Fprintf(w, "<p>This will include most locked constraints as well thanks to dev variants.</p>\n")
@@ -657,23 +632,4 @@ func errorf(w http.ResponseWriter, msg string, args ...any) error {
 	err := fmt.Errorf(msg, args...)
 	fmt.Fprintf(w, "<span>%s</span>\n", err.Error())
 	return err
-}
-
-func (h *handler) boilerplate(w http.ResponseWriter) func() {
-	fmt.Fprintf(w, "<html>\n")
-	fmt.Fprintf(w, "<style>\n")
-	fmt.Fprintf(w, `body {
-	font-family: monospace;
-	width: fit-content;
-	overflow-wrap: anywhere;
-	padding: 12px;
-}`)
-	fmt.Fprintf(w, "</style>\n")
-	fmt.Fprintf(w, "<body>\n")
-	fmt.Fprintf(w, "<h1><a href=%q>tfimages</a></h1>\n", h.ref(""))
-
-	return func() {
-		fmt.Fprintf(w, "</body>\n")
-		fmt.Fprintf(w, "</html>\n")
-	}
 }

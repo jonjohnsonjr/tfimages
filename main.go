@@ -40,7 +40,11 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	http.HandleFunc("/", h.ServeHTTP)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		defer boilerplate(w, "")()
+
+		h.ServeHTTP(w, r)
+	})
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -70,4 +74,23 @@ func run(ctx context.Context) error {
 	})
 
 	return g.Wait()
+}
+
+func boilerplate(w http.ResponseWriter, root string) func() {
+	fmt.Fprintf(w, "<html>\n")
+	fmt.Fprintf(w, "<style>\n")
+	fmt.Fprintf(w, `body {
+	font-family: monospace;
+	width: fit-content;
+	overflow-wrap: anywhere;
+	padding: 12px;
+}`)
+	fmt.Fprintf(w, "</style>\n")
+	fmt.Fprintf(w, "<body>\n")
+	fmt.Fprintf(w, "<h1><a href=%q>tfimages</a></h1>\n", root+"/")
+
+	return func() {
+		fmt.Fprintf(w, "</body>\n")
+		fmt.Fprintf(w, "</html>\n")
+	}
 }
