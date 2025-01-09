@@ -4,7 +4,6 @@ go 1.23.0
 
 require (
 	chainguard.dev/apko v0.18.1
-	github.com/google/go-cmp v0.6.0
 	github.com/hashicorp/terraform-json v0.22.1
 	github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966
 	golang.org/x/sync v0.8.0
@@ -24,6 +23,7 @@ require (
 	github.com/go-git/go-billy/v5 v5.5.0 // indirect
 	github.com/go-git/go-git/v5 v5.12.0 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
+	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/go-containerregistry v0.20.2 // indirect
 	github.com/hashicorp/go-version v1.6.0 // indirect
 	github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 // indirect
