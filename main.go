@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"slices"
-	"strings"
 	"time"
 
 	"chainguard.dev/apko/pkg/build/types"
@@ -395,27 +394,7 @@ func (h *handler) walkModules(m *tfjson.StateModule) error {
 				return fmt.Errorf("unmarshal: %w", err)
 			}
 
-			saw := map[string]bool{}
-
-			for _, pkg := range ic.Contents.Packages {
-				for _, ver := range []string{
-					"3.7",
-					"3.8",
-					"3.9",
-					"3.10",
-					"3.11",
-					"3.12",
-					"3.13",
-				} {
-					if strings.HasPrefix(pkg, "py"+ver) || strings.HasPrefix(pkg, "python-"+ver) {
-						saw[ver] = true
-					}
-				}
-			}
-
-			if len(saw) > 1 {
-				h.add(repo, r.Address, &ic)
-			}
+			h.add(repo, r.Address, &ic)
 		}
 	}
 
