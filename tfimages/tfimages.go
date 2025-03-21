@@ -17,8 +17,8 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-func New(p tfjson.Plan, root string) (http.Handler, error) {
-	h := &handler{
+func New(p tfjson.Plan, root string) (*Handler, error) {
+	h := &Handler{
 		root:         root,
 		repoByAddr:   map[string]string{},
 		configs:      map[string]*imageConfig{},
@@ -28,6 +28,7 @@ func New(p tfjson.Plan, root string) (http.Handler, error) {
 		byConstraint: map[string]map[string]*imageConfig{},
 	}
 
+	// Do this once just cause.
 	if apkoConfig, ok := p.Config.ProviderConfigs["apko"]; ok {
 		if exprs, ok := apkoConfig.Expressions["extra_packages"]; ok {
 			cv := exprs.ConstantValue
@@ -46,14 +47,22 @@ func New(p tfjson.Plan, root string) (http.Handler, error) {
 		}
 	}
 
+	if err := h.Index(p); err != nil {
+		return nil, err
+	}
+
+	return h, nil
+}
+
+func (h *Handler) Index(p tfjson.Plan) error {
 	log.Printf("walking planned values")
 	if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
-		return nil, err
+		return err
 	}
 
 	log.Printf("walking prior state")
 	if err := h.walkModules(p.PriorState.Values.RootModule); err != nil {
-		return nil, err
+		return err
 	}
 
 	log.Printf("%d configs, %d builds", len(h.configs), len(h.builds))
@@ -95,17 +104,17 @@ func New(p tfjson.Plan, root string) (http.Handler, error) {
 		}
 	}
 
-	return h, nil
+	return nil
 }
 
-func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("%s %s", r.Method, r.URL.String())
 	if err := h.handle(w, r); err != nil {
 		log.Printf("error: %s", err)
 	}
 }
 
-type handler struct {
+type Handler struct {
 	root string
 
 	configs        map[string]*imageConfig
@@ -121,7 +130,7 @@ type handler struct {
 	extraPackages []string
 }
 
-func (h *handler) ref(format string, a ...any) string {
+func (h *Handler) ref(format string, a ...any) string {
 	return fmt.Sprintf("%s/%s", h.root, fmt.Sprintf(format, a...))
 }
 
@@ -136,7 +145,7 @@ type imageConfig struct {
 	config *types.ImageConfiguration
 }
 
-func (h *handler) walkModules(m *tfjson.StateModule) error {
+func (h *Handler) walkModules(m *tfjson.StateModule) error {
 	for _, r := range m.Resources {
 		if r.Type == "apko_build" {
 			val, ok := r.AttributeValues["repo"]
@@ -207,7 +216,7 @@ func (h *handler) walkModules(m *tfjson.StateModule) error {
 	return nil
 }
 
-func (h *handler) build(repo, addr string, ic *types.ImageConfiguration) {
+func (h *Handler) build(repo, addr string, ic *types.ImageConfiguration) {
 	byAddr, ok := h.byRepo[repo]
 	if !ok {
 		byAddr = map[string]*imageBuild{}
@@ -237,7 +246,7 @@ func (h *handler) build(repo, addr string, ic *types.ImageConfiguration) {
 	}
 }
 
-func (h *handler) config(addr string, ic *types.ImageConfiguration) {
+func (h *Handler) config(addr string, ic *types.ImageConfiguration) {
 	cfg := &imageConfig{
 		addr:   addr,
 		config: ic,
@@ -256,7 +265,7 @@ func (h *handler) config(addr string, ic *types.ImageConfiguration) {
 	}
 }
 
-func (h *handler) renderLanding(w http.ResponseWriter) {
+func (h *Handler) renderLanding(w http.ResponseWriter) {
 	fmt.Fprintf(w, "<p><a href=%q>Images (%d)</a></p>\n", h.ref("images"), len(h.byRepo))
 	fmt.Fprintf(w, "<p><a href=%q>Builds (%d)</a></p>\n", h.ref("builds"), len(h.builds))
 	fmt.Fprintf(w, "<p><a href=%q>Packages (%d)</a></p>\n", h.ref("packages"), len(h.byPackage))
@@ -264,11 +273,11 @@ func (h *handler) renderLanding(w http.ResponseWriter) {
 	fmt.Fprintf(w, "<p><a href=%q>Constraints (%d)</a></p>\n", h.ref("constraints"), len(h.byConstraint))
 }
 
-func (h *handler) match(r *http.Request, p string) bool {
+func (h *Handler) match(r *http.Request, p string) bool {
 	return r.URL.Path == h.root+"/"+p
 }
 
-func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
+func (h *Handler) handle(w http.ResponseWriter, r *http.Request) error {
 	if h.match(r, "images") {
 		return h.renderImages(w)
 	}
@@ -319,7 +328,7 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func (h *handler) renderAddr(w http.ResponseWriter, repo, addr string) error {
+func (h *Handler) renderAddr(w http.ResponseWriter, repo, addr string) error {
 	if repo == "" {
 		repo = h.repoByAddr[addr]
 	}
@@ -355,7 +364,7 @@ func (h *handler) renderAddr(w http.ResponseWriter, repo, addr string) error {
 	return nil
 }
 
-func (h *handler) linkify(ic types.ImageConfiguration, page string) types.ImageConfiguration {
+func (h *Handler) linkify(ic types.ImageConfiguration, page string) types.ImageConfiguration {
 	packages := slices.Clone(ic.Contents.Packages)
 	for i, pkg := range packages {
 		href := h.ref("?%s=%s", page, url.QueryEscape(pkg))
@@ -365,7 +374,7 @@ func (h *handler) linkify(ic types.ImageConfiguration, page string) types.ImageC
 	return ic
 }
 
-func (h *handler) renderRepo(w http.ResponseWriter, repo string) error {
+func (h *Handler) renderRepo(w http.ResponseWriter, repo string) error {
 	fmt.Fprintf(w, "<h2>%s</h2>\n", repo)
 	fmt.Fprintf(w, "<ul>\n")
 	byAddr, ok := h.byRepo[repo]
@@ -381,7 +390,7 @@ func (h *handler) renderRepo(w http.ResponseWriter, repo string) error {
 	return nil
 }
 
-func (h *handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
+func (h *Handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
 	fmt.Fprintf(w, "<h2>%s</h2>\n", repo)
 	fmt.Fprintf(w, "<h3>containing %s</h3>\n", pkg)
 	fmt.Fprintf(w, "<ul>\n")
@@ -405,7 +414,7 @@ func (h *handler) renderPkgRepo(w http.ResponseWriter, pkg, repo string) error {
 	return nil
 }
 
-func (h *handler) renderPkg(w http.ResponseWriter, pkg string) error {
+func (h *Handler) renderPkg(w http.ResponseWriter, pkg string) error {
 	fmt.Fprintf(w, "<h2>Images containing %s</h2>\n", pkg)
 	fmt.Fprintf(w, "<p>This is every repo containing a apko_build.config with a packages field containing %q.</p>\n", pkg)
 	fmt.Fprintf(w, "<ul>\n")
@@ -427,7 +436,7 @@ func (h *handler) renderPkg(w http.ResponseWriter, pkg string) error {
 	return nil
 }
 
-func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
+func (h *Handler) renderCfg(w http.ResponseWriter, addr string) error {
 	config, ok := h.configs[addr]
 	if !ok {
 		return errorf(w, "no addr %q", addr)
@@ -496,7 +505,7 @@ func (h *handler) renderCfg(w http.ResponseWriter, addr string) error {
 	return nil
 }
 
-func (h *handler) renderConstraint(w http.ResponseWriter, constraint string) error {
+func (h *Handler) renderConstraint(w http.ResponseWriter, constraint string) error {
 	fmt.Fprintf(w, "<h2>Configs containing %s</h2>\n", constraint)
 	fmt.Fprintf(w, "<p>This is every apko_config.config_contents with a packages field containing %q.</p>\n", constraint)
 	fmt.Fprintf(w, "<ul>\n")
@@ -514,7 +523,7 @@ func (h *handler) renderConstraint(w http.ResponseWriter, constraint string) err
 	return nil
 }
 
-func (h *handler) renderImages(w http.ResponseWriter) error {
+func (h *Handler) renderImages(w http.ResponseWriter) error {
 	fmt.Fprintf(w, "<h2>Images (%d)</h2>\n", len(h.byRepo))
 	fmt.Fprintf(w, "<p>This is every apko_build grouped by repo.</p>\n")
 	fmt.Fprintf(w, "<ul>\n")
@@ -527,7 +536,7 @@ func (h *handler) renderImages(w http.ResponseWriter) error {
 	return nil
 }
 
-func (h *handler) renderPackages(w http.ResponseWriter) error {
+func (h *Handler) renderPackages(w http.ResponseWriter) error {
 	fmt.Fprintf(w, "<h2>Packages (%d)</h2>\n", len(h.byPackage))
 	fmt.Fprintf(w, "<details>")
 	fmt.Fprintf(w, "<summary>Every packages entry in a apko_build.config will show up here.</summary>\n")
@@ -560,7 +569,7 @@ func (h *handler) renderPackages(w http.ResponseWriter) error {
 	return nil
 }
 
-func (h *handler) renderBuilds(w http.ResponseWriter) error {
+func (h *Handler) renderBuilds(w http.ResponseWriter) error {
 	fmt.Fprintf(w, "<h2>Builds (%d)</h2>\n", len(h.builds))
 	fmt.Fprintf(w, "<p>These are the apko_build.config contents for every build.</p>\n")
 	fmt.Fprintf(w, "<ul>\n")
@@ -573,7 +582,7 @@ func (h *handler) renderBuilds(w http.ResponseWriter) error {
 	return nil
 }
 
-func (h *handler) renderConfigs(w http.ResponseWriter) error {
+func (h *Handler) renderConfigs(w http.ResponseWriter) error {
 	fmt.Fprintf(w, "<h2>Configs (%d)</h2>\n", len(h.configs))
 	fmt.Fprintf(w, "<details>")
 	fmt.Fprintf(w, "<summary>These are the config_contents of every apko_config in the plan's prior_state.</summary>\n")
@@ -614,7 +623,7 @@ func (h *handler) renderConfigs(w http.ResponseWriter) error {
 	return nil
 }
 
-func (h *handler) renderConstraints(w http.ResponseWriter) error {
+func (h *Handler) renderConstraints(w http.ResponseWriter) error {
 	fmt.Fprintf(w, "<h2>Constraints (%d)</h2>\n", len(h.byConstraint))
 	fmt.Fprintf(w, "<p>Every packages entry in apko_config.config_contents will show up here.</p>\n")
 	fmt.Fprintf(w, "<p>This will include most locked constraints as well thanks to dev variants.</p>\n")

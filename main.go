@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -31,13 +33,28 @@ func main() {
 func run(ctx context.Context) error {
 	log.Printf("decoding plan")
 	var p tfjson.Plan
-	if err := json.NewDecoder(os.Stdin).Decode(&p); err != nil {
+
+	dec := json.NewDecoder(os.Stdin)
+	if err := dec.Decode(&p); err != nil {
 		return err
 	}
 
 	h, err := tfimages.New(p, "")
 	if err != nil {
 		return err
+	}
+
+	for {
+		var p tfjson.Plan
+		if err := dec.Decode(&p); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+		if err := h.Index(p); err != nil {
+			return err
+		}
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
