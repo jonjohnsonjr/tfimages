@@ -17,7 +17,36 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-func New(p tfjson.Plan, root string) (http.Handler, error) {
+func (h *handler) findExtraPackages(p tfjson.Plan) {
+	apkoConfig, ok := p.Config.ProviderConfigs["apko"]
+	if !ok {
+		return
+	}
+
+	exprs, ok := apkoConfig.Expressions["extra_packages"]
+	if !ok {
+		return
+	}
+	cv := exprs.ConstantValue
+	list, ok := cv.([]any)
+	if !ok {
+		return
+	}
+
+	for _, el := range list {
+		if pkg, ok := el.(string); ok {
+			h.extraPackages = append(h.extraPackages, pkg)
+		} else {
+			continue
+		}
+	}
+}
+
+func (h *handler) Packages() []string {
+	return slices.Collect(maps.Keys(h.byPackage))
+}
+
+func New(p tfjson.Plan, root string) (*handler, error) {
 	h := &handler{
 		root:         root,
 		repoByAddr:   map[string]string{},
@@ -28,23 +57,7 @@ func New(p tfjson.Plan, root string) (http.Handler, error) {
 		byConstraint: map[string]map[string]*imageConfig{},
 	}
 
-	if apkoConfig, ok := p.Config.ProviderConfigs["apko"]; ok {
-		if exprs, ok := apkoConfig.Expressions["extra_packages"]; ok {
-			cv := exprs.ConstantValue
-			list, ok := cv.([]any)
-			if !ok {
-				return nil, fmt.Errorf("extra_packages is a %T", cv)
-			}
-
-			for _, el := range list {
-				if pkg, ok := el.(string); ok {
-					h.extraPackages = append(h.extraPackages, pkg)
-				} else {
-					return nil, fmt.Errorf("extra_packages element is a %T", el)
-				}
-			}
-		}
-	}
+	h.findExtraPackages(p)
 
 	log.Printf("walking planned values")
 	if err := h.walkModules(p.PlannedValues.RootModule); err != nil {

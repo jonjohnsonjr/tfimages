@@ -40,6 +40,13 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == "packages" {
+		for _, pkg := range h.Packages() {
+			fmt.Println(pkg)
+		}
+		return nil
+	}
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		defer boilerplate(w, "")()
 
