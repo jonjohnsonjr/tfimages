@@ -67,8 +67,8 @@ func (h *Handler) Index(p tfjson.Plan) error {
 
 	log.Printf("%d configs, %d builds", len(h.configs), len(h.builds))
 
-	h.versionGetters = make([]string, 0, len(h.configs)-len(h.builds))
-	h.orphans = make([]string, 0, len(h.configs)-len(h.builds))
+	h.versionGetters = make([]string, 0, max(0, len(h.configs)-len(h.builds)))
+	h.orphans = make([]string, 0, max(0, len(h.configs)-len(h.builds)))
 
 	for addr, cfg := range h.configs {
 		buildAddr := strings.ReplaceAll(addr, "data.apko_config", "apko_build")
