@@ -278,6 +278,10 @@ func (h *Handler) match(r *http.Request, p string) bool {
 }
 
 func (h *Handler) handle(w http.ResponseWriter, r *http.Request) error {
+	if h.match(r, "images.json") {
+		return h.renderImagesJSON(w)
+	}
+
 	if h.match(r, "images") {
 		return h.renderImages(w)
 	}
@@ -525,6 +529,8 @@ func (h *Handler) renderConstraint(w http.ResponseWriter, constraint string) err
 
 func (h *Handler) renderImages(w http.ResponseWriter) error {
 	fmt.Fprintf(w, "<h2>Images (%d)</h2>\n", len(h.byRepo))
+	fmt.Fprint(w, "<a href=./images.json>Images JSON</a>\n")
+
 	fmt.Fprintf(w, "<p>This is every apko_build grouped by repo.</p>\n")
 	fmt.Fprintf(w, "<ul>\n")
 	for _, repo := range slices.Sorted(maps.Keys(h.byRepo)) {
@@ -533,6 +539,20 @@ func (h *Handler) renderImages(w http.ResponseWriter) error {
 	}
 	fmt.Fprintf(w, "</ul>\n")
 
+	return nil
+}
+
+func (h *Handler) renderImagesJSON(w http.ResponseWriter) error {
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// write slices.Sorted(maps.Keys(h.byRepo)) to json
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(slices.Sorted(maps.Keys(h.byRepo))); err != nil {
+		return errorf(w, "encode: %w", err)
+	}
 	return nil
 }
 

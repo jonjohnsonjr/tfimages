@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"time"
 
 	tfjson "github.com/hashicorp/terraform-json"
@@ -57,9 +58,12 @@ func run(ctx context.Context) error {
 		}
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		defer boilerplate(w, "")()
+	var jsonPathRegex = regexp.MustCompile(`\.json$`)
 
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if !jsonPathRegex.MatchString(r.URL.Path) {
+			defer boilerplate(w, "")()
+		}
 		h.ServeHTTP(w, r)
 	})
 
