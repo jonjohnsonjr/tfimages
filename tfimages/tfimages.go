@@ -55,14 +55,18 @@ func New(p tfjson.Plan, root string) (*Handler, error) {
 }
 
 func (h *Handler) Index(p tfjson.Plan) error {
-	log.Printf("walking planned values")
-	if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
-		return err
+	if p.PlannedValues != nil && p.PlannedValues.RootModule != nil {
+		log.Printf("walking planned values")
+		if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
+			return err
+		}
 	}
 
-	log.Printf("walking prior state")
-	if err := h.walkModules(p.PriorState.Values.RootModule); err != nil {
-		return err
+	if p.PriorState != nil && p.PriorState.Values != nil && p.PriorState.Values.RootModule != nil {
+		log.Printf("walking prior state")
+		if err := h.walkModules(p.PriorState.Values.RootModule); err != nil {
+			return err
+		}
 	}
 
 	log.Printf("%d configs, %d builds", len(h.configs), len(h.builds))
