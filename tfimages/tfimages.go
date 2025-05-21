@@ -55,14 +55,18 @@ func New(p tfjson.Plan, root string) (*Handler, error) {
 }
 
 func (h *Handler) Index(p tfjson.Plan) error {
-	log.Printf("walking planned values")
-	if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
-		return err
+	if p.PlannedValues != nil && p.PlannedValues.RootModule != nil {
+		log.Printf("walking planned values")
+		if err := h.walkModules(p.PlannedValues.RootModule); err != nil {
+			return err
+		}
 	}
 
-	log.Printf("walking prior state")
-	if err := h.walkModules(p.PriorState.Values.RootModule); err != nil {
-		return err
+	if p.PriorState != nil && p.PriorState.Values != nil && p.PriorState.Values.RootModule != nil {
+		log.Printf("walking prior state")
+		if err := h.walkModules(p.PriorState.Values.RootModule); err != nil {
+			return err
+		}
 	}
 
 	log.Printf("%d configs, %d builds", len(h.configs), len(h.builds))
@@ -605,7 +609,7 @@ func (h *Handler) renderBuilds(w http.ResponseWriter) error {
 func (h *Handler) renderConfigs(w http.ResponseWriter) error {
 	fmt.Fprintf(w, "<h2>Configs (%d)</h2>\n", len(h.configs))
 	fmt.Fprintf(w, "<details>")
-	fmt.Fprintf(w, "<summary>These are the config_contents of every apko_config in the plan's prior_state.</summary>\n")
+	fmt.Fprintf(w, "<summary>These are the config_contents of every apko_config in the plan.</summary>\n")
 	fmt.Fprintf(w, "<ul>\n")
 	for _, addr := range slices.Sorted(maps.Keys(h.configs)) {
 		href := h.ref("?cfg=%s", url.QueryEscape(addr))
