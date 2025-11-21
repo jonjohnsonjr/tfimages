@@ -33,17 +33,18 @@ func New(p tfjson.Plan, root string) (*Handler, error) {
 		if exprs, ok := apkoConfig.Expressions["extra_packages"]; ok {
 			cv := exprs.ConstantValue
 			list, ok := cv.([]any)
-			if !ok {
-				return nil, fmt.Errorf("extra_packages is a %T", cv)
+			if ok {
+				for _, el := range list {
+					if pkg, ok := el.(string); ok {
+						h.extraPackages = append(h.extraPackages, pkg)
+					} else {
+						log.Printf("extra_packages element is a %T", el)
+					}
+				}
+			} else {
+				log.Printf("extra_packages is a %T", cv)
 			}
 
-			for _, el := range list {
-				if pkg, ok := el.(string); ok {
-					h.extraPackages = append(h.extraPackages, pkg)
-				} else {
-					return nil, fmt.Errorf("extra_packages element is a %T", el)
-				}
-			}
 		}
 	}
 

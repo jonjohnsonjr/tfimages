@@ -45,6 +45,8 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	var errs []error
+
 	for {
 		var p tfjson.Plan
 		if err := dec.Decode(&p); err != nil {
@@ -54,8 +56,12 @@ func run(ctx context.Context) error {
 			return err
 		}
 		if err := h.Index(p); err != nil {
-			return err
+			errs = append(errs, err)
 		}
+	}
+
+	for _, err := range errs {
+		log.Printf("err: %v", err)
 	}
 
 	var jsonPathRegex = regexp.MustCompile(`\.json$`)
